@@ -1,0 +1,13 @@
+.env
+*.json
+*.log
+logs/
+tmp/
+temp/
+*.tmp
+*.swp
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.coverage
