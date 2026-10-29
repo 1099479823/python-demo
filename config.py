@@ -80,7 +80,13 @@ NUMBER_ATTEMPTS = int(os.getenv("NUMBER_ATTEMPTS", "4"))        # 取号重试�
 NUMBER_RETRY_INTERVAL = float(os.getenv("NUMBER_RETRY_INTERVAL", "5"))  # 每次间隔秒
 MAX_NUMBERS = int(os.getenv("MAX_NUMBERS", "6"))                # 换号上限
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "5"))
-CAPTCHA_RETRIES = int(os.getenv("CAPTCHA_RETRIES", "3"))
+CAPTCHA_RETRIES = int(os.getenv("CAPTCHA_RETRIES", "2"))
+# 滑块缺口定位：OpenCV 内容匹配（xhs_captcha_cv.py），旧 scipy 方案已移除
+# 区分度 margin 低于此值直接换题，不做无意义拖动（省一次风控计数）
+CAPTCHA_MIN_MARGIN = float(os.getenv("CAPTCHA_MIN_MARGIN", "0.05"))
+# 换题前的随机停顿（秒），避免机械节奏被判定为脚本
+CAPTCHA_REFRESH_DELAY_MIN = float(os.getenv("CAPTCHA_REFRESH_DELAY_MIN", "3"))
+CAPTCHA_REFRESH_DELAY_MAX = float(os.getenv("CAPTCHA_REFRESH_DELAY_MAX", "5"))
 HEADLESS_DELAY = float(os.getenv("HEADLESS_DELAY", "0"))
 ASSETS_DIR = ROOT / "captcha_assets"
 

@@ -22,7 +22,7 @@ Python 3.10+（本机验证 3.12.6，路径 C:\dev\python\python.exe）
 ### 2. 依赖
 
 ```powershell
-C:\dev\python\python.exe -m pip install requests playwright numpy pillow scipy openpyxl
+C:\dev\python\python.exe -m pip install requests playwright numpy pillow openpyxl opencv-python-headless
 ```
 
 ### 3. 比特浏览器
@@ -174,6 +174,7 @@ Excel 五列：
 | `python check_stock.py` | 各 service 库存 |
 | `python check_map.py` | Excel 行 → 窗口绑定干跑（不开窗不花钱） |
 | `python check_sendcode.py` | 发码判定逻辑自测（-13002 场景） |
+| `python check_captcha_drag.py --matrix` | 滑块拖拽离线自检：假页面模拟 k，输出落点误差 + 轨迹统计（不开窗） |
 | `python cleanup_numbers.py` | 取消遗留号码 |
 | `python test_publish.py <窗口ID> [文件] [标题] [正文]` | 单窗口发帖测试 |
 
@@ -277,10 +278,16 @@ Excel 五列：
 
 ### 滑块怎么破的
 
-- 背景图 `*_hole.png` 有两块同形暗块（目标洞 + 干扰影子）
-- 亮度阈值 + 连通域找候选，按拼图块蒙版算形状 IoU 排序，默认取上方
-- 先拖 24px 读 `translate3d` 实测映射系数 k（0.80~1.37），再一次性拖到位
+缺口定位只保留 OpenCV 内容匹配一套（旧 scipy 形状方案已移除，`xhs_captcha_cv.py`）。
+
+- 背景图 `*_hole.png` 有两块同形暗块（目标洞 + 干扰影子），**轮廓几乎完全一样**（49 组历史样本里 18 组两者形状 IoU 都是 0.99），所以光看形状分不出来
+- 真缺口是**被压暗、模糊过的拼图块本体**，干扰块是画面另一处的同形暗斑 → 判据用「拼图块内容 ↔ 缺口内内容」的零均值归一化相关（`cv2.matchTemplate(TM_CCOEFF_NORMED, mask=alpha)`），亮度差被 CCOEFF 归一化抵消
+- 候选定位走 `cv2.morphologyEx + connectedComponentsWithStats`，按面积/边长/长宽比/填充率过滤
+- 先拖 2 个近距离点读 `translate3d` 实测映射系数 k（0.80~1.37），做过原点**最小二乘**拟合；残差 >25% 或 k 越界说明读数不可信，按舞台宽度兜底而不是硬算
+- 拖动走**拟人轨迹**：最小加加速度速度曲线（起止速度为 0）/ 步间隔抖动 + 2~3 次微停顿 / y 轴 ±1.6px 抖动 / 45% 概率过冲 2~6px 再回拉 / 松手前手抖找位；落点偏差 >2px 才回拉修正，最多两轮
 - 失败点「换一换」并轮换策略 `top / right / inner`，命中策略写入 `strategy.json`
+- 拼图块图形在元素内左侧有 **13px 透明边**（题库固定，51 组样本无一例外），算位移时必须扣掉，否则整体偏右约 1/4 框；代码按 alpha bbox 动态读取，并按「元素宽 / 原图宽」比例换算（元素 58px 时约 8.2px）
+- 区分度 `margin < 0.05` 时直接换题、不硬拖；同一弹窗最多试 2 次，换题前随机停 3~5 秒——高频连试会触发风控，后面分数再高也一律不过
 
 ### 发布按钮为什么这么绕
 
@@ -315,7 +322,8 @@ Excel 五列：
 ```
 python-demo/
 ├─ xhs_login.py        登录/注册主流程（多国家回退）
-├─ xhs_captcha.py      滑块识别与拖动
+├─ xhs_captcha.py      滑块识别与拖动（流程/拖拽/策略轮换）
+├─ xhs_captcha_cv.py   缺口定位内核（OpenCV 内容匹配）
 ├─ xhs_batch.py        批量登录（子进程隔离）
 ├─ xhs_publish.py      发帖核心（上传/填写/发布/判定）
 ├─ xhs_post.py         Excel 驱动的批量发帖
@@ -325,6 +333,7 @@ python-demo/
 ├─ check_api.py        余额 / 库存
 ├─ check_stock.py      service 库存
 ├─ check_map.py        Excel→窗口 绑定干跑
+├─ check_captcha_drag.py  滑块拖拽离线自检（假页面 + 轨迹统计）
 ├─ check_sendcode.py   发码判定自测
 ├─ cleanup_numbers.py  取消遗留号码
 ├─ test_publish.py     单窗口发帖测试
