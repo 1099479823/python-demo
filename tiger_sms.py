@@ -155,6 +155,48 @@ class TigerSMS:
     def cancel(self, activation_id: str) -> str:
         return self.set_status(activation_id, 8)
 
+    def cancel_with_retry(self, activation_id: str, created_at: float | None = None,
+                          min_lifetime: float = 125.0, tries: int = 6) -> tuple[bool, str]:
+        """
+        取消号码（退号退款），自动处理平台的 EARLY_CANCEL_DENIED。
+
+        平台要求号码存活 ≥120 秒才允许取消：90 秒等码结束时常常还没到点，
+        直接 cancel 会被拒，号码继续计费。这里按创建时间算出还差多久，
+        等够再取消，避免白扣费。
+
+        返回 (是否成功取消, 最后一次平台响应)。
+        """
+        last = ""
+        deadline = time.time() + 240          # 总兜底，别无限等
+        for i in range(1, tries + 1):
+            try:
+                last = self.cancel(activation_id)
+            except Exception as e:
+                last = f"exception:{e}"
+
+            if "ACCESS_CANCEL" in last:
+                log.info("退号成功: %s (%s)", activation_id, last)
+                return True, last
+            if "NO_ACTIVATION" in last:
+                log.warning("退号失败：平台已无该激活 %s", activation_id)
+                return False, last
+            if "EARLY_CANCEL_DENIED" in last:
+                wait = 3.0
+                if created_at:
+                    wait = max(2.0, min_lifetime - (time.time() - created_at))
+                wait = min(max(wait, 2.0), 60.0)
+                if time.time() + wait > deadline:
+                    log.warning("退号放弃：等待超时 (%s)", activation_id)
+                    return False, last
+                log.info("平台要求号存活 %.0fs，还差 %.0fs，等待后再取消 (%d/%d)",
+                         min_lifetime, wait, i, tries)
+                time.sleep(wait)
+                continue
+            # 其他响应：稍等重试
+            log.warning("退号响应异常(%s)，重试 %d/%d", last[:60], i, tries)
+            time.sleep(2.0)
+        return False, last
+
     # ---------- 等码 ----------
     @staticmethod
     def parse_code(status_text: str) -> Optional[str]:

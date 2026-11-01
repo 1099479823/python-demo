@@ -49,19 +49,22 @@ COUNTRY_CODE_US = os.getenv("TIGER_COUNTRY_CODE_US", "1")
 # 美国号单价上限（超过这个价的 provider 不买）
 MAX_PRICE_US = os.getenv("TIGER_MAX_PRICE_US", "0.05")
 
-# 国家备用顺序：运行时按“可用号码数”自动排序（号多的先用），接不到再换下一个
+# 国家尝试顺序：**固定按此列表顺序**（泰国优先，泰国失败才换美国）
+# 想调整优先级直接改这里的先后顺序即可
 COUNTRY_LIST = [
     {"label": "Thailand", "cn": "泰国", "id": COUNTRY_ID, "code": COUNTRY_CODE,
      "max_price": None},
     {"label": "United States", "cn": "美国", "id": COUNTRY_ID_US, "code": COUNTRY_CODE_US,
      "max_price": MAX_PRICE_US},
 ]
-# 每个国家最多连续失败几个号就换下一个国家（取号无货 / 收不到码 / 发码被拒 都算失败）
+# 已废弃：每国号码数统一由 MAX_NUMBERS 控制，保留读取仅为兼容旧 .env
 COUNTRY_SWITCH_AFTER = int(os.getenv("COUNTRY_SWITCH_AFTER", "3"))
 
 # ---------- 比特浏览器 ----------
 BIT_API = os.getenv("BIT_API", "http://127.0.0.1:54345")
 BROWSER_ID = os.getenv("BIT_BROWSER_ID", "")
+# 分组**名称**（先用 /group/list 换出 groupId，再按 groupId 分页拉窗口）
+# 留空 = 全量窗口；写部分名称也能唯一匹配，例如 "默认分组"
 BROWSER_GROUP = os.getenv("BIT_BROWSER_GROUP", "")
 
 # ---------- 站点 ----------
@@ -75,10 +78,11 @@ POST_EXCEL = os.getenv("POST_EXCEL") or str(Path.home() / "Desktop" / "测试.xl
 POST_SLEEP = float(os.getenv("POST_SLEEP", "10"))
 
 # ---------- 行为参数 ----------
-CODE_WAIT_SECONDS = int(os.getenv("CODE_WAIT_SECONDS", "90"))   # 单号等码时长
+CODE_WAIT_SECONDS = int(os.getenv("CODE_WAIT_SECONDS", "90"))   # 拿到号码后等码上限
 NUMBER_ATTEMPTS = int(os.getenv("NUMBER_ATTEMPTS", "4"))        # 取号重试次数
 NUMBER_RETRY_INTERVAL = float(os.getenv("NUMBER_RETRY_INTERVAL", "5"))  # 每次间隔秒
-MAX_NUMBERS = int(os.getenv("MAX_NUMBERS", "6"))                # 换号上限
+# 每个国家最多试几个号（等码 90s 超时即换下一个）；该国全失败 -> 换下一个国家
+MAX_NUMBERS = int(os.getenv("MAX_NUMBERS", "3"))
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "5"))
 CAPTCHA_RETRIES = int(os.getenv("CAPTCHA_RETRIES", "2"))
 # 滑块缺口定位：OpenCV 内容匹配（xhs_captcha_cv.py），旧 scipy 方案已移除

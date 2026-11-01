@@ -90,12 +90,16 @@ def read_excel(path: str) -> list[dict]:
 
 # ------------------------------------------------------------------ 窗口
 def find_browser_id(seq: int) -> str | None:
-    r = requests.post(f"{C.BIT_API}/browser/list",
-                      json={"page": 0, "pageSize": 500}, timeout=60).json()
-    if not r.get("success"):
-        return None
+    """在配置的分组（BIT_BROWSER_GROUP）里按窗口名精确找 id"""
+    import bit_client
     want = f"小红书测试{seq}"
-    for b in r["data"]["list"]:
+    try:
+        # 先用接口的 name 模糊过滤缩小分页范围，再精确比对
+        items = bit_client.list_browsers(group_name=C.BROWSER_GROUP or None, name=want)
+    except Exception as e:
+        log.error("拉取窗口列表失败: %s", e)
+        return None
+    for b in items:
         if (b.get("name") or "").strip() == want:
             return b["id"]
     return None
@@ -105,7 +109,7 @@ def find_browser_id(seq: int) -> str | None:
 async def ensure_login(page, ctx, cli: TigerSMS, browser_id: str, win_name: str,
                        args) -> tuple[bool, dict]:
     """确认这个窗口能进 creator 发布页；不能则走注册登录"""
-    if await P.is_logged_in(page):
+    if await P.is_logged_in(page, ctx=ctx):
         log.info("窗口已登录")
         return True, {}
 
@@ -127,18 +131,16 @@ async def ensure_login(page, ctx, cli: TigerSMS, browser_id: str, win_name: str,
             continue
         log.info("== 使用国家 %s（区号 %s / 平台ID %s）==", cn, cur, country["id"])
 
-        fails = 0
+        # 每国固定试 N 个号（默认 3）：等码 90s 超时 → 换号
         for n in range(1, args.max_numbers + 1):
-            if fails >= C.COUNTRY_SWITCH_AFTER:
-                log.warning("%s 连续失败 %d 次，换下一个国家", cn, fails)
-                break
+            log.info("=== %s 第 %d/%d 个号码 ===", cn, n, args.max_numbers)
             try:
                 r = await try_one_number(page, cli, C.SERVICE, country, args.wait_seconds)
             except XL.NoNumbersError as e:
                 log.warning("%s 无库存，换下一个国家: %s", cn, e)
                 break
             except Exception as e:
-                log.warning("%s 第 %d 次尝试异常: %s", cn, n, e)
+                log.warning("%s 第 %d 个号异常: %s", cn, n, e)
                 r = {"ok": False, "reason": f"exception:{e}"}
 
             if r.get("ok"):
@@ -147,8 +149,7 @@ async def ensure_login(page, ctx, cli: TigerSMS, browser_id: str, win_name: str,
                 log.info("%s 注册登录成功: %s", cn, page.url)
                 return True, r
 
-            fails += 1
-            log.warning("%s 第 %d 次注册失败: %s", cn, n, r.get("reason"))
+            log.warning("%s 第 %d/%d 个号失败: %s", cn, n, args.max_numbers, r.get("reason"))
             try:
                 await open_login(page)
                 await select_country(page, country["label"], country["code"])
@@ -156,7 +157,7 @@ async def ensure_login(page, ctx, cli: TigerSMS, browser_id: str, win_name: str,
                 log.warning("重置登录页失败: %s", e)
 
     # 两国都拿不到号/收不到码：不是这一台的问题，继续跑没意义，直接停
-    return False, {"reason": "当前时段无号码可用（泰国与美国均取不到号或收不到验证码）",
+    return False, {"reason": "当前时段无手机号可用（泰国与美国均取不到号或收不到验证码）",
                    "no_numbers": True}
 
 

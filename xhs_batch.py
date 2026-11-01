@@ -49,11 +49,14 @@ SUMMARY = Path("batch_summary.json")
 
 # ------------------------------------------------------------------ 窗口
 def list_browsers() -> list[dict]:
-    r = requests.post(f"{C.BIT_API}/browser/list",
-                      json={"page": 0, "pageSize": 500}, timeout=60).json()
-    if not r.get("success"):
-        raise RuntimeError(f"取窗口列表失败: {r.get('msg')}")
-    return [b for b in r["data"]["list"] if not b.get("isDelete") and not b.get("isRemove")]
+    """
+    按配置的分组（BIT_BROWSER_GROUP）分页拉取窗口：
+    先 /group/list 把分组名换成 groupId，再 /browser/list 分页
+    （page 从 0 开始；pageSize 上限 100，超出仍只返回 100 条）。
+    """
+    import bit_client
+    items = bit_client.list_browsers(group_name=C.BROWSER_GROUP or None)
+    return [b for b in items if not b.get("isDelete") and not b.get("isRemove")]
 
 
 def seq_of(b: dict) -> int:

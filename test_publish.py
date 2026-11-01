@@ -24,7 +24,7 @@ async def main():
             ctx = b.contexts[0]
             page = await ctx.new_page()
 
-            logged = await P.is_logged_in(page)
+            logged = await P.is_logged_in(page, ctx=ctx)
             print("creator 登录态:", logged, "| url:", page.url)
             if not logged:
                 print("未登录，跳过发帖测试")

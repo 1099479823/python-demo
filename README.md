@@ -51,7 +51,7 @@ TIGER_SERVICE=qf               # 小红书在平台的 service 代码（qf）
 TIGER_COUNTRY_ID=52            # sms-activate 兼容国家表，泰国=52
 TIGER_COUNTRY_CODE=66          # 国际电话前缀，程序会自动剥掉
 
-# 美国（备用通道；运行时按库存自动决定先用谁）
+# 美国（备用通道：泰国取不到号/收不到码才切过来）
 TIGER_COUNTRY_ID_US=187
 TIGER_COUNTRY_CODE_US=1
 TIGER_MAX_PRICE_US=0.05        # 美国号单价上限，超过不买
@@ -120,7 +120,7 @@ C:\dev\python\python.exe xhs_login.py --mock-phone 981234567 --browser-id <窗�
 ```powershell
 C:\dev\python\python.exe xhs_login.py --browser-id <窗口ID>
 
-# 只跑某个国家（默认按库存自动选）
+# 只跑某个国家（默认泰国优先，失败自动切美国）
 C:\dev\python\python.exe xhs_login.py --browser-id <ID> --country us
 
 # 只到收码为止
@@ -189,7 +189,7 @@ Excel 五列：
 | `--browser-id` | 比特窗口 ID |
 | `--name-prefix` | 按窗口名筛选 |
 | `--out` | 结果文件，默认 `login_result.json` |
-| `--country {,th,us}` | 只跑指定国家，留空则按库存自动选 |
+| `--country {,th,us}` | 只跑指定国家，留空则泰国→美国按序尝试 |
 | `--service` | 覆盖 `TIGER_SERVICE` |
 | `--probe-service` | 探测可用 service 再跑 |
 | `--wait-seconds` | 单号等码秒数，默认 90 |
@@ -250,14 +250,14 @@ Excel 五列：
 
 1. 打开比特窗口 → CDP 接管 → 进 `https://www.rednote.com/login`
    （必须国际版，`xiaohongshu.com` 区号固定 +86）
-2. **查两国实时库存 → 号多的先用**（美国限价 0.05，只算买得起的）
+2. **固定顺序：泰国优先**，泰国 3 个号都失败才切美国（库存只打日志参考，不参与排序）
 3. 切区号 → 取号（带 maxPrice）→ **剥掉国家前缀** → 填号
 4. 点 `Get code`：
    - 返回 **471** → 弹滑块 → 识别缺口 + 拟人拖动 → 通过后前端重发 → **200**
    - 返回 **200 但 `code:-13002`**（发送失败）→ **立即退号换下一个**
-5. 轮询 `getStatus`，90 秒无码 → 退号换号
+5. 轮询 `getStatus`，90 秒无码 → **退号退款**（平台要求号存活 ≥125 秒，不够就等够再退，`cancel_with_retry` 自动处理，成功退号才换下一个号）
 6. 收到码 → 填码 → 登录 → 跳过性别/兴趣引导 → 导出 cookie
-7. 单国连败 3 次 → 换国家；两国都失败 → **当前时段无号码可用，直接停**
+7. 单国 3 个号都失败 → 换下一个国家；两国都失败 → **当前时段无手机号可用，直接停**
 
 ### 发帖
 
@@ -309,7 +309,7 @@ Excel 五列：
 | `NO_NUMBERS` ×4 → 当前时段无号码可用 | 号池缺货 | 等补货；调大 `NUMBER_ATTEMPTS` |
 | `send_code` 返回 `code:-13002` | 平台拒绝该号发码 | 已自动秒换号 |
 | 滑块一直不过 | 轨迹被判机器 / 选错洞 | 自动换策略重试 3 次；仍不行换窗口 |
-| `EARLY_CANCEL_DENIED` | 平台要求号存活 ≥120 秒 | 等 2 分钟再取消 |
+| `EARLY_CANCEL_DENIED` | 平台要求号存活 ≥125 秒才可退 | 已自动处理：`cancel_with_retry` 会算好剩余时间、等够再退，退成功才换号 |
 | 发帖提示「图片上传中，请稍后」 | 点太早 | 已改为等缩略图 + 文本静默再点，且会自动重点 |
 | 点发布没反应 | 点到侧边栏「发布笔记」了 | 已改用 `_sr` 精确定位 |
 | 登录成功但 `ok:false` | 停在完善资料页 | 已自动点 Continue |

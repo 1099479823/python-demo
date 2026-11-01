@@ -409,15 +409,48 @@ async def publish_post(page, file_path: str, title: str = "", content: str = "",
 
 
 # ------------------------------------------------------------------ 登录态
-async def is_logged_in(page) -> bool:
-    """creator 平台能否直接进发布页（页面渲染较慢，要等 tab 出现）"""
+LOGIN_COOKIE_NAMES = ("web_session", "customerClientId", "id_token")
+
+
+async def read_login_cookies(ctx) -> dict:
+    """读浏览器 cookie jar 里的登录 cookie（不是外部导出文件）"""
+    out = {}
+    try:
+        for c in await ctx.cookies():
+            if c.get("name") in LOGIN_COOKIE_NAMES and c.get("value"):
+                dom = c.get("domain") or ""
+                if "rednote.com" in dom or "xiaohongshu.com" in dom:
+                    out[c["name"]] = c["value"]
+    except Exception as e:
+        log.warning("读取浏览器 cookie 失败: %s", e)
+    return out
+
+
+async def is_logged_in(page, ctx=None, deep: bool = True) -> bool:
+    """
+    判断窗口是否已登录。
+
+    1) 先用**浏览器当前 cookie**（ctx.cookies()）判断：有 web_session 才可能登录
+       —— 不发页面请求，直接反映该指纹环境的真实状态
+    2) deep=True 时再打开 creator 发布页确认 cookie 真有效（可能已过期/被踢）
+
+    ctx 不传时退化为纯页面判断（兼容旧调用）。
+    """
+    if ctx is not None:
+        cookies = await read_login_cookies(ctx)
+        names = ", ".join(f"{k}({len(v)}B)" for k, v in cookies.items()) or "无"
+        log.info("浏览器 cookie 登录态: %s", names)
+        if "web_session" not in cookies:
+            return False
+        if not deep:
+            return True
+
     try:
         await page.goto(PUBLISH_URL, wait_until="domcontentloaded", timeout=60000)
         if "login" in page.url:
             return False
         if await _wait_tabs(page, timeout=25):
             return True
-        # 再兜底看一眼 URL 和页面文案
         if "login" in page.url:
             return False
         txt = (await page.inner_text("body"))[:200]

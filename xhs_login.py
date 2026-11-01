@@ -85,12 +85,17 @@ def bit_close(browser_id: str) -> None:
 
 
 def bit_first_browser(name_prefix: str = "") -> str:
-    r = requests.post(f"{C.BIT_API}/browser/list", json={"page": 0, "pageSize": 200}, timeout=60).json()
-    items = r.get("data", {}).get("list", [])
+    """按配置的分组（BIT_BROWSER_GROUP）拉窗口，取第一个匹配的"""
+    import bit_client
+    try:
+        items = bit_client.list_browsers(group_name=C.BROWSER_GROUP or None)
+    except Exception as e:
+        log.error("拉取窗口列表失败: %s", e)
+        raise
     if name_prefix:
         items = [x for x in items if name_prefix in (x.get("name") or "")]
     if not items:
-        raise RuntimeError("没有可用窗口，请先在比特浏览器里创建")
+        raise RuntimeError(f"分组 {C.BROWSER_GROUP!r} 下没有可用窗口")
     return items[0]["id"]
 
 
@@ -224,8 +229,64 @@ async def handle_onboarding(page: Page, log=log, rounds: int = 4) -> None:
         await page.wait_for_timeout(1000)
 
 
-async def logged_in(page: Page, timeout: float = 20.0) -> bool:
-    """判断是否已登录：URL 离开登录页，或已进入新用户引导页（注册已完成）"""
+# ------------------------------------------------------------------ 登录态（读浏览器 cookie）
+# 小红书登录后的关键 cookie（rednote.com / .rednote.com 域）
+LOGIN_COOKIE_NAMES = ("web_session", "customerClientId", "id_token", "ets", "a1")
+
+
+async def read_login_cookies(ctx) -> dict:
+    """
+    读**浏览器当前 cookie jar** 里的登录信息（不是外部导出/文件里的 cookie）。
+
+    Playwright 的 ctx.cookies() 直接取自浏览器的 cookie 存储，
+    包含该指纹环境已登录留下的 web_session 等，能真实反映"这个窗口有没有登录"。
+    """
+    out = {}
+    try:
+        cookies = await ctx.cookies()
+    except Exception as e:
+        log.warning("读取浏览器 cookie 失败: %s", e)
+        return out
+    for c in cookies:
+        name = c.get("name")
+        if name in LOGIN_COOKIE_NAMES and c.get("value"):
+            dom = c.get("domain") or ""
+            if "rednote.com" not in dom and "xiaohongshu.com" not in dom:
+                continue
+            out[name] = {
+                "value": c["value"],
+                "domain": dom,
+                "expires": c.get("expires"),
+                "length": len(c["value"]),
+            }
+    return out
+
+
+async def has_login_cookie(ctx) -> tuple[bool, dict]:
+    """浏览器里是否存在有效登录 cookie（web_session 是硬判据）"""
+    info = await read_login_cookies(ctx)
+    return bool(info.get("web_session")), info
+
+
+def describe_cookies(info: dict) -> str:
+    if not info:
+        return "无登录 cookie"
+    return ", ".join(f"{k}({v['length']}B)" for k, v in info.items())
+
+
+async def logged_in(page: Page, timeout: float = 20.0, ctx=None) -> bool:
+    """
+    判断是否已登录：优先看浏览器 cookie，其次看页面状态。
+
+    ctx 传入时会先查浏览器 cookie jar 里的 web_session —— 有就直接算登录，
+    没有则再看 URL/引导页（新注册账号偶尔 cookie 写入略滞后）。
+    """
+    if ctx is not None:
+        ok, info = await has_login_cookie(ctx)
+        if ok:
+            log.info("浏览器 cookie 显示已登录: %s", describe_cookies(info))
+            return True
+
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
@@ -233,6 +294,11 @@ async def logged_in(page: Page, timeout: float = 20.0) -> bool:
                 return True
             if await on_onboarding(page):
                 return True
+            if ctx is not None:      # cookie 可能刚写入，轮询时再看一眼
+                ok, info = await has_login_cookie(ctx)
+                if ok:
+                    log.info("浏览器 cookie 显示已登录: %s", describe_cookies(info))
+                    return True
         except Exception:
             pass
         await page.wait_for_timeout(1200)
@@ -316,20 +382,18 @@ def country_stock(cli, service: str, country: dict) -> int:
 
 def order_countries(cli, service: str) -> list[dict]:
     """
-    按「可用号码数」降序排列国家：谁号多用谁，都查不到就按配置顺序。
-    查询失败(-1)排最后，但仍会尝试。
+    国家的尝试顺序 = COUNTRY_LIST 的配置顺序（泰国在前、美国在后），固定不变。
+
+    库存只打日志做参考，不参与排序：泰国优先，泰国取不到号/收不到码才换美国。
     """
-    scored = []
-    for idx, c in enumerate(C.COUNTRY_LIST):
+    ordered = list(C.COUNTRY_LIST)
+    for c in ordered:
         n = country_stock(cli, service, c)
-        scored.append((n, idx, c))
         cap = c.get("max_price")
-        log.info("库存检查：%s(%s)%s -> %s",
+        log.info("库存参考：%s(%s)%s -> %s",
                  c.get("cn"), c.get("id"), f" 限价 ${cap}" if cap else "",
                  "查询失败" if n < 0 else f"{n} 个")
-    scored.sort(key=lambda t: (0 if t[0] >= 0 else 1, -t[0], t[1]))
-    ordered = [c for _, _, c in scored]
-    log.info("国家尝试顺序：%s",
+    log.info("国家尝试顺序（固定）：%s",
              " -> ".join(f"{c.get('cn')}({c['id']})" for c in ordered))
     return ordered
 
@@ -404,6 +468,7 @@ async def try_one_number(page: Page, cli: TigerSMS, service: str,
                               attempts=C.NUMBER_ATTEMPTS, interval=C.NUMBER_RETRY_INTERVAL,
                               max_price=country.get("max_price"),
                               country_cn=country.get("cn", ""))
+    t_acq = time.time()          # 记下取号时刻，退号时要算平台的最小存活时间
     local = strip_country_prefix(act.phone, ccode)
     log.info("取号 %s/%s  原始=%s  填写=%s  id=%s",
              country.get("cn", label), service, act.phone, local, act.activation_id)
@@ -427,6 +492,7 @@ async def try_one_number(page: Page, cli: TigerSMS, service: str,
         await page.wait_for_timeout(600)
 
     await send_code(page)
+    t_send = time.time()      # 等码 90s 预算从「点击发送验证码」这一刻开始算
 
     # 快速判定：-13002「发送验证码失败」立刻换号，不再等滑块/等码
     for _ in range(6):
@@ -436,10 +502,9 @@ async def try_one_number(page: Page, cli: TigerSMS, service: str,
     rej = _send_rejected(trace)
     if rej:
         log.warning("发送验证码失败(code=%s)，立即换号", rej)
-        try:
-            cli.cancel(act.activation_id)
-        except Exception:
-            pass
+        ok_c, resp_c = cli.cancel_with_retry(act.activation_id, t_acq)
+        if not ok_c:
+            log.warning("退号失败(可能仍在计费): %s", resp_c)
         return {"ok": False, "reason": f"send_code_rejected:{rej}",
                 "activation": act.id_dict(), "trace": trace}
 
@@ -451,10 +516,9 @@ async def try_one_number(page: Page, cli: TigerSMS, service: str,
         ok = await captcha.solve_captcha(page, C.ASSETS_DIR, retries=C.CAPTCHA_RETRIES)
         if not ok:
             log.warning("滑块未通过，取消该号换下一个")
-            try:
-                cli.cancel(act.activation_id)
-            except Exception:
-                pass
+            ok_c, resp_c = cli.cancel_with_retry(act.activation_id, t_acq)
+            if not ok_c:
+                log.warning("退号失败(可能仍在计费): %s", resp_c)
             return {"ok": False, "reason": "captcha_failed", "activation": act.id_dict()}
         await page.wait_for_timeout(1500)
 
@@ -497,22 +561,33 @@ async def try_one_number(page: Page, cli: TigerSMS, service: str,
         rej = _send_rejected(trace)
         log.warning("发码未成功(按钮=%s, 业务码=%s, 响应=%s)，换号重试",
                     await code_button_text(page), rej or "-", trace[-2:])
-        try:
-            cli.cancel(act.activation_id)
-        except Exception:
-            pass
+        ok_c, resp_c = cli.cancel_with_retry(act.activation_id, t_acq)
+        if not ok_c:
+            log.warning("退号失败(可能仍在计费): %s", resp_c)
         return {"ok": False,
                 "reason": f"send_code_rejected:{rej}" if rej else "send_code_failed",
                 "activation": act.id_dict(), "trace": trace}
     log.info("短信已发出，开始等码 (响应序列 %s)", [t["status"] for t in trace])
 
-    code = cli.wait_code(act.activation_id, timeout=wait_seconds, interval=C.POLL_INTERVAL)
+    # 等码预算：从「点击发送验证码」起算 90 秒（滑块耗时也算在内）。
+    # 剩余不足 15 秒就直接换号，免得刚点完码就超时白等。
+    elapsed = time.time() - t_send
+    remain = wait_seconds - elapsed
+    log.info("等码预算: 总 %ss - 发码/滑块已用 %.0fs = 剩余 %.0fs", wait_seconds, elapsed, remain)
+    if remain < 15:
+        log.warning("发码+滑块已用 %.0fs，剩余不足 15s，直接退号换下一个号码", elapsed)
+        ok_c, resp_c = cli.cancel_with_retry(act.activation_id, t_acq)
+        if not ok_c:
+            log.warning("退号失败(可能仍在计费): %s", resp_c)
+        return {"ok": False, "reason": "no_sms_budget", "activation": act.id_dict()}
+
+    code = cli.wait_code(act.activation_id, timeout=remain, interval=C.POLL_INTERVAL)
     if not code:
-        log.warning("90 秒未收到验证码，取消 %s 并换号", act.activation_id)
-        try:
-            cli.cancel(act.activation_id)
-        except Exception as e:
-            log.debug("cancel 失败: %s", e)
+        log.warning("从发码起 %ss 内未收到验证码，退号 %s 并换下一个号码",
+                    wait_seconds, act.activation_id)
+        ok_c, resp_c = cli.cancel_with_retry(act.activation_id, t_acq)
+        if not ok_c:
+            log.warning("退号失败(可能仍在计费): %s", resp_c)
         return {"ok": False, "reason": "no_sms", "activation": act.id_dict()}
 
     log.info("收到验证码: %s", code)
@@ -525,7 +600,7 @@ async def try_one_number(page: Page, cli: TigerSMS, service: str,
     await submit_login(page)
     await page.wait_for_timeout(3000)
 
-    if await logged_in(page, timeout=25):
+    if await logged_in(page, timeout=25, ctx=ctx):
         try:
             cli.complete(act.activation_id)
         except Exception:
@@ -600,11 +675,19 @@ async def run(args) -> int:
             page.on("response", lambda r: asyncio.ensure_future(_trace_response(r)))
             await open_login(page)
 
-            # 窗口本来就登录着：直接导出 cookie，不浪费号码
-            if "login" not in page.url:
+            # 浏览器 cookie（实时读 cookie jar，不是导出文件）
+            cookie_ok, cookie_info = await has_login_cookie(ctx)
+            page_ok = "login" not in page.url
+            log.info("登录态 | 浏览器 cookie: %s | 页面: %s",
+                     describe_cookies(cookie_info), "已进站" if page_ok else "停在登录页")
+
+            # 判定以「页面能进站」为准：cookie 可能残留但已被服务端踢掉（实测会 401）
+            if page_ok:
                 await handle_onboarding(page)
                 cookies = await ctx.cookies()
-                result = {"ok": True, "url": page.url, "note": "窗口已登录，直接导出 cookie",
+                result = {"ok": True, "url": page.url,
+                          "note": "窗口已登录",
+                          "login_cookie": describe_cookies(cookie_info),
                           "cookies": {c["name"]: c["value"] for c in cookies
                                       if c["domain"].endswith("rednote.com")}}
                 log.info("窗口已登录: %s", page.url)
@@ -617,14 +700,20 @@ async def run(args) -> int:
                                  ensure_ascii=False, indent=2))
                 return 0
 
+            if cookie_ok:
+                log.warning("浏览器里有 web_session，但页面被弹回登录页 -> cookie 已失效，需重新登录")
+
             # 只扫描登录态：没登录就直接返回，不取号不花钱
             if args.scan_only:
                 res = {"ok": False, "reason": "not_logged_in", "url": page.url,
+                       "cookie_present": cookie_ok,
+                       "cookie_stale": cookie_ok,
+                       "login_cookie": describe_cookies(cookie_info),
                        "window_seq": window_seq(browser_id, win_name)}
                 out = Path(args.out)
                 out.parent.mkdir(parents=True, exist_ok=True)
                 out.write_text(json.dumps(res, ensure_ascii=False, indent=2), encoding="utf-8")
-                log.info("扫描：未登录 %s", page.url)
+                log.info("扫描：未登录 %s（cookie: %s）", page.url, describe_cookies(cookie_info))
                 return 1
 
             # 多国家回退：按当前可用号码数动态排序（号多的先用），接不到再换下一个
@@ -646,11 +735,9 @@ async def run(args) -> int:
                 log.info("== 使用国家 %s（区号 %s / 平台ID %s）==",
                          country.get("cn"), cur, country["id"])
 
-                fails = 0
+                # 每国固定试 N 个号（默认 3）：等码 90s 超时 → 换下一个号
+                # 该国 N 个号全失败 → 换下一个国家；两国都失败 → 当前时段无手机号可用
                 for attempt in range(1, args.max_numbers + 1):
-                    if fails >= C.COUNTRY_SWITCH_AFTER:
-                        log.warning("%s 连续失败 %d 次，换下一个国家", country.get("cn"), fails)
-                        break
                     log.info("=== %s 第 %d/%d 个号码 ===", country.get("cn"), attempt, args.max_numbers)
 
                     # 上一轮可能已经成功（引导页/首页），先确认一下，别浪费号码
@@ -708,11 +795,11 @@ async def run(args) -> int:
                         success = True
                         break
 
-                    fails += 1
-                    log.warning("%s 第 %d 次失败: %s", country.get("cn"), attempt, r.get("reason"))
+                    log.warning("%s 第 %d/%d 个号失败: %s",
+                                country.get("cn"), attempt, args.max_numbers, r.get("reason"))
 
                     # 二次判定：可能只是判定时机问题
-                    if await logged_in(page, timeout=5):
+                    if await logged_in(page, timeout=5, ctx=ctx):
                         phone = r.get("phone") or ""
                         cookies = await ctx.cookies()
                         result = {
@@ -770,8 +857,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--name-prefix", default="", help="按窗口名筛选，如 小红书测试")
     ap.add_argument("--service", default="", help="接码平台 service 代码，默认取配置")
     ap.add_argument("--probe-service", action="store_true", help="先用价格接口探测可用 service")
-    ap.add_argument("--wait-seconds", type=int, default=C.CODE_WAIT_SECONDS, help="单号等码秒数")
-    ap.add_argument("--max-numbers", type=int, default=C.MAX_NUMBERS, help="最多换几个号")
+    ap.add_argument("--wait-seconds", type=int, default=C.CODE_WAIT_SECONDS, help="拿到号码后等码上限秒数（默认 90）")
+    ap.add_argument("--max-numbers", type=int, default=C.MAX_NUMBERS, help="每个国家最多试几个号（默认 3）")
     ap.add_argument("--dry-run", action="store_true", help="只做发码+滑块，不登录")
     ap.add_argument("--mock-phone", default="", help="自测用：固定手机号，不调接码平台")
     ap.add_argument("--scan-only", action="store_true",
