@@ -97,6 +97,16 @@ def pick(args) -> list[dict]:
         items = [b for b in items if args.prefix in (b.get("name") or "")]
     items.sort(key=seq_of)
 
+    if getattr(args, "seqs", ""):
+        want = parse_seq_spec(args.seqs)
+        before = len(items)
+        items = [b for b in items if seq_of(b) in want]
+        missing = sorted(want - {seq_of(b) for b in items})
+        print(f"按序号指定 {sorted(want)} -> 命中 {len(items)}/{before} 台"
+              + (f"（分组里没有: {missing}）" if missing else ""))
+        if not items:
+            raise SystemExit(f"--seqs {args.seqs} 没有匹配到任何窗口，请检查序号或分组配置")
+
     if args.exclude:
         ex = parse_seq_spec(args.exclude)
         before = len(items)
@@ -237,6 +247,8 @@ def save_summary(results: list[dict], total: int, bal0: float) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser(description="依次登录多个窗口")
     ap.add_argument("--ids", default="", help="逗号分隔窗口 ID（按给定顺序执行）")
+    ap.add_argument("--seqs", default="",
+                    help="只跑这些窗口序号，支持区间：85,86,90-95（按序号从小到大执行）")
     ap.add_argument("--prefix", default="小红书测试", help="按名称筛选")
     ap.add_argument("--start", type=int, default=0, help="名称序号下限")
     ap.add_argument("--end", type=int, default=0, help="名称序号上限")

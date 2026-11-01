@@ -276,33 +276,54 @@ def describe_cookies(info: dict) -> str:
 
 async def logged_in(page: Page, timeout: float = 20.0, ctx=None) -> bool:
     """
-    判断是否已登录：优先看浏览器 cookie，其次看页面状态。
+    判断是否**真的**登录成功：以页面为准（URL 离开 /login，或已进新用户引导页）。
 
-    ctx 传入时会先查浏览器 cookie jar 里的 web_session —— 有就直接算登录，
-    没有则再看 URL/引导页（新注册账号偶尔 cookie 写入略滞后）。
+    ⚠ 不能只看 cookie：浏览器里可能残留上一轮/失效的 web_session，
+    那样会在验证码都没填对的情况下被判成功（踩过这个坑）。
+    cookie 这里只用来打印日志，不参与判定。
     """
-    if ctx is not None:
-        ok, info = await has_login_cookie(ctx)
-        if ok:
-            log.info("浏览器 cookie 显示已登录: %s", describe_cookies(info))
-            return True
-
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
             if "login" not in page.url:
+                if ctx is not None:
+                    ok, info = await has_login_cookie(ctx)
+                    log.info("页面已离站，浏览器 cookie: %s", describe_cookies(info))
                 return True
             if await on_onboarding(page):
                 return True
-            if ctx is not None:      # cookie 可能刚写入，轮询时再看一眼
-                ok, info = await has_login_cookie(ctx)
-                if ok:
-                    log.info("浏览器 cookie 显示已登录: %s", describe_cookies(info))
-                    return True
         except Exception:
             pass
         await page.wait_for_timeout(1200)
     return False
+
+
+async def verify_login(page: Page, ctx=None, timeout: float = 25.0) -> tuple[bool, dict]:
+    """
+    严格校验登录结果，返回 (是否成功, 详情)。
+
+    三个条件同时满足才算成功：
+      1. 页面离开 /login（或进入引导页）
+      2. 浏览器 cookie 里有 web_session
+      3. 详情里带上 cookie 摘要，便于排查
+    """
+    page_ok = await logged_in(page, timeout=timeout, ctx=ctx)
+    if not page_ok:
+        return False, {"page_ok": False, "reason": "页面仍在登录页"}
+
+    cookie_ok, info = False, {}
+    for _ in range(8):                      # cookie 写入可能滞后 1~2 秒
+        cookie_ok, info = await has_login_cookie(ctx) if ctx is not None else (False, {})
+        if cookie_ok or ctx is None:
+            break
+        await page.wait_for_timeout(1000)
+
+    if ctx is not None and not cookie_ok:
+        return False, {"page_ok": True, "cookie_ok": False,
+                       "reason": "页面离站但浏览器没有 web_session，登录未真正完成"}
+
+    return True, {"page_ok": True, "cookie_ok": cookie_ok,
+                  "cookie": describe_cookies(info), "url": page.url}
 
 
 # ------------------------------------------------------------------ 成功记录
@@ -393,7 +414,9 @@ def order_countries(cli, service: str) -> list[dict]:
         log.info("库存参考：%s(%s)%s -> %s",
                  c.get("cn"), c.get("id"), f" 限价 ${cap}" if cap else "",
                  "查询失败" if n < 0 else f"{n} 个")
-    log.info("国家尝试顺序（固定）：%s",
+    if C.COUNTRY_ORDER_INVALID:
+        log.warning("COUNTRY_ORDER 里有无效项，已忽略: %s", C.COUNTRY_ORDER_INVALID)
+    log.info("国家尝试顺序（来自 COUNTRY_ORDER）：%s",
              " -> ".join(f"{c.get('cn')}({c['id']})" for c in ordered))
     return ordered
 
@@ -451,9 +474,109 @@ async def demo_send_and_solve(page: Page, phone: str) -> dict:
     return {"ok": ok and sent, "reason": "captcha_passed" if ok else "captcha_failed", "button": btn}
 
 
+# ------------------------------------------------------------------ 用码登录
+CODE_ERR_HINTS = ("验证码错误", "验证码已失效", "验证码不正确", "验证码已过期",
+                  "code error", "invalid code", "验证码有误")
+
+
+async def _code_form_ready(page) -> bool:
+    """页面是否还停在可填验证码的状态"""
+    try:
+        return "login" in page.url and (await page.locator(C.SEL["code_input"]).count()) > 0
+    except Exception:
+        return False
+
+
+async def _refund_or_mark(cli, act, t_acq, log=log) -> tuple[str, str]:
+    """退号：成功=refunded（钱回来了），失败=wasted（短信已送达退不了）"""
+    try:
+        refunded, resp = cli.cancel_with_retry(act.activation_id, t_acq)
+    except Exception as e:
+        refunded, resp = False, f"exception:{e}"
+    if refunded:
+        log.info("该号未用上，已退号退款: %s", resp)
+        return "refunded", str(resp)
+    log.warning("该号未用上且退不回来: %s -> 记为浪费", str(resp)[:60])
+    return "wasted", str(resp)
+
+
+async def submit_code_until_success(page, ctx, code: str, country: dict, local: str,
+                                    tries: int = None, log=log) -> tuple[bool, dict]:
+    """
+    用已收到的验证码登录，最多试 CODE_SUBMIT_TRIES 次。
+
+    为什么必须重试：手机号一旦收到短信，接码平台就不允许取消/退款
+    （setStatus(8) 会返回 SMS_RECEIVED）。所以校验码没填进去就换号，
+    这个号的钱就白花了。常见失败原因是时序（页面还在跳转/被刷新），
+    重填一次通常就能成功。
+    """
+    if tries is None:
+        tries = getattr(C, "CODE_SUBMIT_TRIES", 3)
+    last = {}
+    submitted = 0          # 成功把码填进输入框并点了登录的次数
+    for i in range(1, tries + 1):
+        try:
+            # ① 页面已经跑走了？先看是不是其实登录了
+            if "login" not in page.url:
+                ok, d = await verify_login(page, ctx=ctx, timeout=5)
+                if ok:
+                    return True, d
+                log.warning("填码前页面已离站且未登录，拉回登录页重试 (%d/%d)", i, tries)
+                await open_login(page)
+                await select_country(page, country["label"], country["code"])
+
+            # ② 页面被重置过 -> 手机号框空了，补填回去（不重发短信）
+            if not await _code_form_ready(page):
+                await open_login(page)
+                await select_country(page, country["label"], country["code"])
+            try:
+                phone_now = await page.input_value(C.SEL["phone"])
+            except Exception:
+                phone_now = ""
+            if not phone_now:
+                await page.fill(C.SEL["phone"], local)
+                await page.wait_for_timeout(random.randint(300, 700))
+
+            # ③ 填码并提交
+            await page.fill(C.SEL["code_input"], "")
+            await page.fill(C.SEL["code_input"], code)
+            await page.wait_for_timeout(random.randint(400, 1000))
+            await submit_login(page)
+            submitted += 1
+            await page.wait_for_timeout(3500)
+
+            ok, d = await verify_login(page, ctx=ctx, timeout=8)
+            if ok:
+                log.info("第 %d/%d 次提交验证码 %s -> 登录成功（%s）", i, tries, code, d.get("cookie"))
+                d["submitted"] = submitted
+                return True, d
+
+            last = d
+            notice = ""
+            try:
+                notice = (await page.inner_text("body"))[:400]
+            except Exception:
+                pass
+            if any(k in notice for k in CODE_ERR_HINTS):
+                log.warning("第 %d/%d 次提交，页面提示验证码错误，重试无意义", i, tries)
+                return False, {"reason": "code_rejected", "notice": notice[:120],
+                               "submitted": submitted, **(d or {})}
+            log.warning("第 %d/%d 次提交未成功: %s，稍后重试", i, tries, d.get("reason"))
+        except Exception as e:
+            log.warning("第 %d/%d 次提交验证码异常: %s", i, tries, e)
+            last = {"reason": f"exception:{e}"}
+        await page.wait_for_timeout(1500)
+
+    out = dict(last or {})
+    out.setdefault("reason", "code_submit_failed")
+    out["submitted"] = submitted
+    return False, out
+
+
 async def try_one_number(page: Page, cli: TigerSMS, service: str,
                          country: dict,
-                         wait_seconds: int, dry_run: bool = False) -> dict:
+                         wait_seconds: int, dry_run: bool = False,
+                         ctx=None) -> dict:
     """
     一次完整尝试：取号 -> 填号 -> 发码 -> 过滑块 -> 等码
     country: {"label": "Thailand", "id": "52", "code": "66"}
@@ -515,7 +638,28 @@ async def try_one_number(page: Page, cli: TigerSMS, service: str,
         log.info("检测到滑块，开始处理")
         ok = await captcha.solve_captcha(page, C.ASSETS_DIR, retries=C.CAPTCHA_RETRIES)
         if not ok:
-            log.warning("滑块未通过，取消该号换下一个")
+            # 滑块没过，但短信可能已经发出去了 —— 放弃就白花钱，先试着收码
+            log.warning("滑块未通过，先确认是否有短信到达（有就直接用掉，不退号）")
+            early = cli.wait_code(act.activation_id,
+                                  timeout=C.CODE_GRACE_SECONDS, interval=C.POLL_INTERVAL)
+            if early:
+                log.info("滑块虽未通过但已收到验证码 %s，继续用它登录", early)
+                ok_login, detail = await submit_code_until_success(
+                    page, ctx, early, country, local, log=log)
+                if ok_login:
+                    try:
+                        cli.complete(act.activation_id)
+                    except Exception:
+                        pass
+                    await handle_onboarding(page)
+                    return {"ok": True, "activation": act.id_dict(), "phone": act.phone,
+                            "code": early, "cookie": detail.get("cookie"),
+                            "usage": "used", "submitted": detail.get("submitted", 0)}
+                usage, refund_resp = await _refund_or_mark(cli, act, t_acq, log)
+                return {"ok": False, "reason": "captcha_failed_code_unused",
+                        "activation": act.id_dict(), "code": early,
+                        "usage": usage, "refund": str(refund_resp)[:80]}
+            log.warning("滑块未通过且宽限期内无短信，退号换下一个")
             ok_c, resp_c = cli.cancel_with_retry(act.activation_id, t_acq)
             if not ok_c:
                 log.warning("退号失败(可能仍在计费): %s", resp_c)
@@ -582,41 +726,76 @@ async def try_one_number(page: Page, cli: TigerSMS, service: str,
         return {"ok": False, "reason": "no_sms_budget", "activation": act.id_dict()}
 
     code = cli.wait_code(act.activation_id, timeout=remain, interval=C.POLL_INTERVAL)
+
+    # 宽限期：短信常比预期晚到几秒，直接退号就白买了
     if not code:
-        log.warning("从发码起 %ss 内未收到验证码，退号 %s 并换下一个号码",
-                    wait_seconds, act.activation_id)
+        grace = getattr(C, "CODE_GRACE_SECONDS", 30)
+        log.info("主预算 %.0fs 内没收到码，进入 %ss 宽限期继续等", remain, grace)
+        code = cli.wait_code(act.activation_id, timeout=grace, interval=C.POLL_INTERVAL)
+
+    # 退号前最后查一次状态，避免「刚超时 1 秒码就到了」被退掉
+    if not code:
+        try:
+            st = cli.status(act.activation_id)
+            code = TigerSMS.parse_code(st)
+            if code:
+                log.info("退号前最后检查发现验证码 %s，继续使用", code)
+        except Exception as e:
+            log.debug("退号前查询状态失败: %s", e)
+
+    if not code:
+        log.warning("从发码起共 %.0fs 仍未收到验证码，尝试退号 %s",
+                    wait_seconds + getattr(C, "CODE_GRACE_SECONDS", 30), act.activation_id)
         ok_c, resp_c = cli.cancel_with_retry(act.activation_id, t_acq)
-        if not ok_c:
-            log.warning("退号失败(可能仍在计费): %s", resp_c)
-        return {"ok": False, "reason": "no_sms", "activation": act.id_dict()}
+        if not ok_c and "SMS_RECEIVED" in str(resp_c):
+            # 平台说短信已送达 -> 说明码确实发出去了，再等最后一轮
+            log.warning("平台提示短信已送达(SMS_RECEIVED)，再等最后一轮 60s 抢救")
+            code = cli.wait_code(act.activation_id, timeout=60, interval=C.POLL_INTERVAL)
+            if code:
+                log.info("抢救成功，拿到验证码 %s", code)
+        if not code:
+            if ok_c:
+                log.info("已退号退款: %s", resp_c)
+            else:
+                log.warning("退号失败(可能仍在计费): %s", resp_c)
+            return {"ok": False, "reason": "no_sms", "activation": act.id_dict(),
+                    "usage": "refunded" if ok_c else "wasted"}
 
     log.info("收到验证码: %s", code)
     if dry_run:
         log.info("dry-run：跳过填码登录")
         return {"ok": True, "activation": act.id_dict(), "phone": act.phone, "code": code, "dry_run": True}
 
-    await page.fill(C.SEL["code_input"], code)
-    await page.wait_for_timeout(random.randint(500, 1100))
-    await submit_login(page)
-    await page.wait_for_timeout(3000)
-
-    if await logged_in(page, timeout=25, ctx=ctx):
+    # 号码已经收到短信 = 平台不允许退号，必须把这个码用掉，否则钱白花
+    ok_login, detail = await submit_code_until_success(page, ctx, code, country, local, log=log)
+    if ok_login:
         try:
             cli.complete(act.activation_id)
         except Exception:
             pass
         await handle_onboarding(page)
-        return {"ok": True, "activation": act.id_dict(), "phone": act.phone, "code": code}
+        return {"ok": True, "activation": act.id_dict(), "phone": act.phone,
+                "code": code, "cookie": detail.get("cookie"),
+                "usage": "used", "submitted": detail.get("submitted", 0)}
 
-    # 失败留现场，便于排查（协议弹窗 / 验证码错误 / 二次风控）
+    # 多次提交仍失败：留现场便于排查
     try:
         stamp = time.strftime("%H%M%S")
         await page.screenshot(path=str(Path(f"login_fail_{stamp}.png")))
         body = (await page.inner_text("body"))[:300].replace("\n", " / ")
-        log.warning("登录失败页面: %s", body)
+        log.warning("用码登录失败，页面: %s", body)
     except Exception:
         pass
-    return {"ok": False, "reason": "login_failed", "activation": act.id_dict(), "phone": act.phone, "code": code}
+    # 判定这个号到底有没有被用掉：
+    #   退号成功(ACCESS_CANCEL)   -> refunded，钱回来了，不算浪费
+    #   退号被拒(SMS_RECEIVED 等) -> wasted，短信已送达，钱退不回
+    usage, refund_resp = await _refund_or_mark(cli, act, t_acq, log)
+
+    return {"ok": False, "reason": f"code_login_failed:{detail.get('reason')}",
+            "detail": detail, "activation": act.id_dict(),
+            "phone": act.phone, "code": code,
+            "usage": usage, "submitted": detail.get("submitted", 0),
+            "refund": str(refund_resp)[:80]}
 
 
 # ------------------------------------------------------------------ 主流程
@@ -719,12 +898,14 @@ async def run(args) -> int:
             # 多国家回退：按当前可用号码数动态排序（号多的先用），接不到再换下一个
             success = False
             countries = order_countries(cli, service)
-            if getattr(args, "country", ""):
-                _picked = [c for c in countries
-                           if (args.country == "th" and c["code"] == C.COUNTRY_CODE)
-                           or (args.country == "us" and c["code"] == C.COUNTRY_CODE_US)]
+            _only = getattr(args, "country", "") or ""
+            if _only:
+                _picked = [c for c in countries if c.get("key") == _only]
                 if _picked:
                     countries = _picked
+                else:
+                    log.warning("--country %s 不在当前配置的国家顺序里（%s），按全部国家跑",
+                                _only, " -> ".join(c["key"] for c in countries))
             for country in countries:
                 if success:
                     break
@@ -755,7 +936,8 @@ async def run(args) -> int:
 
                     try:
                         r = await try_one_number(page, cli, service, country,
-                                                 args.wait_seconds, dry_run=args.dry_run)
+                                                 args.wait_seconds, dry_run=args.dry_run,
+                                                 ctx=ctx)
                     except NoNumbersError as e:
                         last = e.last_success or {}
                         result = {"ok": False, "reason": "no_numbers", "message": str(e),
@@ -785,6 +967,9 @@ async def run(args) -> int:
                             "activation_id": (r.get("activation") or {}).get("id"),
                             "code": r.get("code"),
                             "dry_run": bool(r.get("dry_run")),
+                            "usage": r.get("usage") or "used",
+                            "submitted": r.get("submitted"),
+                            "cookie": r.get("cookie"),
                             "url": page.url,
                             "window_seq": window_seq(browser_id, win_name),
                             "cookies": {c["name"]: c["value"] for c in cookies
@@ -798,27 +983,33 @@ async def run(args) -> int:
                     log.warning("%s 第 %d/%d 个号失败: %s",
                                 country.get("cn"), attempt, args.max_numbers, r.get("reason"))
 
-                    # 二次判定：可能只是判定时机问题
+                    # 二次判定：本轮返回失败，但页面可能已经跳走（时序问题）。
+                    # 必须走严格校验（页面离站 + 有 web_session），否则会被残留 cookie 骗过。
                     if await logged_in(page, timeout=5, ctx=ctx):
-                        phone = r.get("phone") or ""
-                        cookies = await ctx.cookies()
-                        result = {
-                            "ok": True,
-                            "phone": phone,
-                            "local": strip_country_prefix(phone, country["code"]),
-                            "country": country.get("cn"),
-                            "activation_id": (r.get("activation") or {}).get("id"),
-                            "code": r.get("code"),
-                            "url": page.url,
-                            "window_seq": window_seq(browser_id, win_name),
-                            "cookies": {c["name"]: c["value"] for c in cookies
-                                        if c["domain"].endswith("rednote.com")},
-                            "note": "二次判定为登录成功",
-                        }
-                        record_success(browser_id, win_name, phone, r.get("code") or "")
-                        log.info("二次判定登录成功: %s", page.url)
-                        success = True
-                        break
+                        ok2, detail2 = await verify_login(page, ctx=ctx, timeout=3)
+                        if not ok2:
+                            log.warning("二次判定不通过，继续换号: %s", detail2.get("reason"))
+                        else:
+                            phone = r.get("phone") or ""
+                            cookies = await ctx.cookies()
+                            result = {
+                                "ok": True,
+                                "phone": phone,
+                                "local": strip_country_prefix(phone, country["code"]),
+                                "country": country.get("cn"),
+                                "activation_id": (r.get("activation") or {}).get("id"),
+                                "code": r.get("code"),
+                                "url": page.url,
+                                "window_seq": window_seq(browser_id, win_name),
+                                "cookies": {c["name"]: c["value"] for c in cookies
+                                            if c["domain"].endswith("rednote.com")},
+                                "note": "二次判定为登录成功",
+                                "cookie": detail2.get("cookie"),
+                            }
+                            record_success(browser_id, win_name, phone, r.get("code") or "")
+                            log.info("二次判定登录成功: %s | %s", page.url, detail2.get("cookie"))
+                            success = True
+                            break
 
                     # 失败后回到干净状态（保持当前国家）
                     try:
@@ -864,8 +1055,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--scan-only", action="store_true",
                     help="只检查窗口是否已登录：已登录则导出 cookie，未登录直接返回，不取号")
     ap.add_argument("--out", default="login_result.json", help="结果文件路径（批量时每个窗口一份）")
-    ap.add_argument("--country", choices=["", "th", "us"], default="",
-                    help="只跑指定国家：th=泰国66 / us=美国1，不填则泰国失败自动换美国")
+    ap.add_argument("--country", choices=[""] + sorted(C.COUNTRY_CATALOG.keys()), default="",
+                    help="只跑指定国家（代号见 COUNTRY_CATALOG，如 th/us）；不填则按 COUNTRY_ORDER")
     ap.add_argument("-v", "--verbose", action="store_true")
     return ap
 

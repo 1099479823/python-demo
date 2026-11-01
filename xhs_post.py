@@ -135,7 +135,7 @@ async def ensure_login(page, ctx, cli: TigerSMS, browser_id: str, win_name: str,
         for n in range(1, args.max_numbers + 1):
             log.info("=== %s 第 %d/%d 个号码 ===", cn, n, args.max_numbers)
             try:
-                r = await try_one_number(page, cli, C.SERVICE, country, args.wait_seconds)
+                r = await try_one_number(page, cli, C.SERVICE, country, args.wait_seconds, ctx=ctx)
             except XL.NoNumbersError as e:
                 log.warning("%s 无库存，换下一个国家: %s", cn, e)
                 break
@@ -144,10 +144,16 @@ async def ensure_login(page, ctx, cli: TigerSMS, browser_id: str, win_name: str,
                 r = {"ok": False, "reason": f"exception:{e}"}
 
             if r.get("ok"):
-                await handle_onboarding(page)
-                record_success(browser_id, win_name, r.get("phone") or "", r.get("code") or "")
-                log.info("%s 注册登录成功: %s", cn, page.url)
-                return True, r
+                # try_one_number 内部已做严格校验，这里再确认一次 cookie 落盘
+                ok_v, detail = await XL.verify_login(page, ctx=ctx, timeout=5)
+                if not ok_v:
+                    log.warning("接码成功但登录校验未通过: %s", detail.get("reason"))
+                    r = {"ok": False, "reason": f"login_verify_failed:{detail.get('reason')}"}
+                else:
+                    await handle_onboarding(page)
+                    record_success(browser_id, win_name, r.get("phone") or "", r.get("code") or "")
+                    log.info("%s 注册登录成功: %s | %s", cn, page.url, detail.get("cookie"))
+                    return True, r
 
             log.warning("%s 第 %d/%d 个号失败: %s", cn, n, args.max_numbers, r.get("reason"))
             try:

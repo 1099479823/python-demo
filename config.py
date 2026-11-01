@@ -49,14 +49,53 @@ COUNTRY_CODE_US = os.getenv("TIGER_COUNTRY_CODE_US", "1")
 # 美国号单价上限（超过这个价的 provider 不买）
 MAX_PRICE_US = os.getenv("TIGER_MAX_PRICE_US", "0.05")
 
-# 国家尝试顺序：**固定按此列表顺序**（泰国优先，泰国失败才换美国）
-# 想调整优先级直接改这里的先后顺序即可
-COUNTRY_LIST = [
-    {"label": "Thailand", "cn": "泰国", "id": COUNTRY_ID, "code": COUNTRY_CODE,
-     "max_price": None},
-    {"label": "United States", "cn": "美国", "id": COUNTRY_ID_US, "code": COUNTRY_CODE_US,
-     "max_price": MAX_PRICE_US},
-]
+# ---------- 接码国家（可配置优先级） ----------
+# 可用国家目录：key 是代号，值是该国完整参数（编号 / 前缀 / 是否限价）
+COUNTRY_CATALOG = {
+    "th": {"key": "th", "label": "Thailand", "cn": "泰国",
+           "id": COUNTRY_ID, "code": COUNTRY_CODE, "max_price": None},
+    "us": {"key": "us", "label": "United States", "cn": "美国",
+           "id": COUNTRY_ID_US, "code": COUNTRY_CODE_US, "max_price": MAX_PRICE_US},
+}
+
+
+def _resolve_country(raw: str) -> str | None:
+    """
+    把用户写的国家标识归一化成 catalog key。
+    支持：代号(th) / 中文名(泰国) / 英文名(Thailand) / 平台编号(52) / 电话前缀(66)
+    """
+    k = (raw or "").strip()
+    if not k:
+        return None
+    kl = k.lower()
+    if kl in COUNTRY_CATALOG:
+        return kl
+    for key, c in COUNTRY_CATALOG.items():
+        if kl in (str(c["cn"]).lower(), str(c["label"]).lower(),
+                  str(c["id"]).lower(), str(c["code"]).lower()):
+            return key
+    return None
+
+
+# 优先级顺序由 .env 的 COUNTRY_ORDER 决定，逗号分隔，越靠前越优先
+# 例：COUNTRY_ORDER=th,us（泰国优先） / us,th（美国优先） / 美国（只用美国）
+COUNTRY_ORDER_RAW = os.getenv("COUNTRY_ORDER", "th,us")
+COUNTRY_LIST = []
+COUNTRY_ORDER_INVALID = []
+for _raw in COUNTRY_ORDER_RAW.split(","):
+    if not _raw.strip():
+        continue
+    _key = _resolve_country(_raw)
+    if _key:
+        if _key not in [c["key"] for c in COUNTRY_LIST]:     # 去重
+            COUNTRY_LIST.append(dict(COUNTRY_CATALOG[_key]))
+    else:
+        COUNTRY_ORDER_INVALID.append(_raw.strip())
+
+if not COUNTRY_LIST:            # 全写错时回退默认顺序，避免程序起不来
+    COUNTRY_LIST = [dict(COUNTRY_CATALOG["th"]), dict(COUNTRY_CATALOG["us"])]
+    COUNTRY_ORDER_INVALID.append(f"全部无效({COUNTRY_ORDER_RAW})，已回退默认 th,us")
+
 # 已废弃：每国号码数统一由 MAX_NUMBERS 控制，保留读取仅为兼容旧 .env
 COUNTRY_SWITCH_AFTER = int(os.getenv("COUNTRY_SWITCH_AFTER", "3"))
 
@@ -79,6 +118,10 @@ POST_SLEEP = float(os.getenv("POST_SLEEP", "10"))
 
 # ---------- 行为参数 ----------
 CODE_WAIT_SECONDS = int(os.getenv("CODE_WAIT_SECONDS", "90"))   # 拿到号码后等码上限
+# 收到验证码后最多提交几次：号已收到短信就无法退款，必须尽量把码用掉
+CODE_SUBMIT_TRIES = int(os.getenv("CODE_SUBMIT_TRIES", "3"))
+# 主等码超时后的宽限期（秒）：短信常晚到几秒，立即退号会白买
+CODE_GRACE_SECONDS = int(os.getenv("CODE_GRACE_SECONDS", "30"))
 NUMBER_ATTEMPTS = int(os.getenv("NUMBER_ATTEMPTS", "4"))        # 取号重试次数
 NUMBER_RETRY_INTERVAL = float(os.getenv("NUMBER_RETRY_INTERVAL", "5"))  # 每次间隔秒
 # 每个国家最多试几个号（等码 90s 超时即换下一个）；该国全失败 -> 换下一个国家
