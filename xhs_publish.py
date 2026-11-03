@@ -188,7 +188,14 @@ async def _fill_content(page, content: str, tags: Iterable[str]) -> None:
 
 
 # ------------------------------------------------------------------ 结果
-ERROR_HINTS = ("账号异常", "禁止发布", "被封禁", "存在风险", "发布失败", "审核不通过",
+# 账号被封禁/禁言的提示（小红书用全局 toast 通知，如「您的账号处于禁言状态」）
+ACCOUNT_BLOCK_HINTS = ("您的账号处于禁言状态", "账号处于禁言", "已被禁言", "被禁言",
+                       "已被封禁", "被封禁", "封号", "账号异常", "账号受限",
+                       "禁止发布", "禁止发笔记", "禁止发帖", "禁止发表",
+                       "违反社区规则", "违反社区公约", "社区规则",
+                       "无法发布", "不能发布", "暂不支持发布",
+                       "存在风险", "功能受限", "账号冻结")
+ERROR_HINTS = ("账号异常", "禁止发布", "被封禁", "禁言", "被禁言", "存在风险", "发布失败", "审核不通过",
                "操作过于频繁", "请稍后再试", "内容违规", "无法发布")
 SUCCESS_HINTS = ("发布成功", "已发布", "笔记发布成功")
 
@@ -198,11 +205,11 @@ async def _read_notice(page) -> str:
     try:
         return await page.evaluate(r"""() => {
             const hits = [];
-            const kw = /上传中|请稍后|发布成功|失败|异常|违规|审核|禁止|风险|频繁/;
+            const kw = /上传中|请稍后|发布成功|已发布|失败|异常|违规|审核|禁止|风险|频繁|禁言|封禁|封号|冻结|限制|受限|无法发布|不能发布|违反|社区规则|社区公约|禁发/;
             document.querySelectorAll('div,span,p').forEach(e => {
                 if (e.childElementCount > 0) return;
                 const t = (e.innerText || '').trim();
-                if (!t || t.length > 40 || !kw.test(t)) return;
+                if (!t || t.length > 80 || !kw.test(t)) return;
                 const r = e.getBoundingClientRect();
                 if (r.width > 40 && r.height > 12) hits.push(t);
             });
@@ -327,7 +334,7 @@ async def _submit(page, timeout: int = 150) -> dict:
 
             if any(k in notice for k in SUCCESS_HINTS):
                 return {"ok": True, "reason": "发布成功", "notice": notice, "click": how}
-            if any(k in notice for k in ("账号异常", "禁止发布", "被封禁", "存在风险", "账号受限")):
+            if any(k in notice for k in ACCOUNT_BLOCK_HINTS):
                 return {"ok": False, "reason": f"账号异常: {notice}", "click": how}
             if any(k in notice for k in ("内容违规", "审核不通过")):
                 return {"ok": False, "reason": f"内容被拒: {notice}", "click": how}

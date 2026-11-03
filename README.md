@@ -34,7 +34,33 @@ C:\dev\python\python.exe -m pip install requests playwright numpy pillow openpyx
 
 ### 4. 接码平台
 
-Tiger SMS 注册充值，拿 `api_key`。实测单价：泰国 0.041、美国 0.02~0.05。
+支持两个平台，用 `SMS_PROVIDER` 切换（协议都是 sms-activate 兼容，代码一套跑）：
+
+| 平台 | 说明 |
+|---|---|
+| **tiger**（默认） | Tiger SMS 注册充值拿 `api_key`。实测单价：泰国 0.041、美国 0.02~0.05 |
+| **hero** | HeroSMS，API 文档见项目根目录 `api-cn.json`。走 `https://hero-sms.com/stubs/handler_api.php` 兼容端点 |
+
+切换方式：
+
+```ini
+# .env
+SMS_PROVIDER=hero
+HERO_API_KEY=你的hero key
+HERO_SERVICE=xhs        # hero 平台的小红书 service 代码，不确定就留空用 --probe-service 探测
+```
+
+```powershell
+# 探测 hero 平台的小红书 service 代码
+python xhs_login.py --probe-service
+```
+
+两个平台的关键差异（代码里已适配）：
+
+- **库存/价格接口**：tiger 用 `getPricesV3`，hero 用 `getPrices` —— `hero_sms.py` 会先试 V3，失败自动回落 `getPrices` 并归一化格式
+- **服务清单**：hero 有 `getServicesList`，探测时按 `xhs/red/rednote` 关键词匹配，比逐个试快
+- **mark_ready**：hero 的 `setStatus` 枚举只有 3/6/8（没有 tiger 的 1=就绪），已跳过该调用
+- **认证**：都是 query 参数 `api_key`，http 401 视为 `BAD_KEY`
 
 ---
 
@@ -48,8 +74,16 @@ Tiger SMS 注册充值，拿 `api_key`。实测单价：泰国 0.041、美国 0.
 BIT_BROWSER_GROUP=gk7l2dm8sk-默认分组
 
 # ---------- 接码平台 ----------
+# 选择：tiger（默认） / hero（新版 api-cn.json 文档在项目根目录）
+SMS_PROVIDER=tiger
+
+# tiger 平台
 TIGER_SMS_KEY=你的32位key
-TIGER_SERVICE=qf               # 小红书在平台的 service 代码（qf）
+TIGER_SERVICE=qf               # 小红书在 tiger 平台的 service 代码（qf）
+
+# hero 平台（SMS_PROVIDER=hero 时使用）
+# HERO_API_KEY=你的hero key
+# HERO_SERVICE=               # hero 平台的小红书 service 代码（留空用 TIGER_SERVICE/探测）
 
 # 泰国（第一优先）
 TIGER_COUNTRY_ID=52            # sms-activate 兼容国家表，泰国=52
@@ -90,6 +124,9 @@ POST_SLEEP=10                                    # 每条发完的间隔秒
 | 参数 | 默认 | 必填 | 说明 |
 |---|---|---|---|
 | `BIT_BROWSER_GROUP` | 空 | ❌ | 分组名称，程序先 `/group/list` 换 groupId 再按组分页拉窗口；留空=全量 |
+| `SMS_PROVIDER` | `tiger` | ❌ | 接码平台选择：`tiger` 或 `hero` |
+| `HERO_API_KEY` | — | hero时✅ | hero 平台的 key（SMS_PROVIDER=hero 时必填） |
+| `HERO_SERVICE` | 空 | ❌ | hero 平台的小红书 service 代码，留空用 `--probe-service` 探测 |
 | `TIGER_SMS_KEY` | — | ✅ | 缺失直接退出（返回码 2） |
 | `TIGER_SERVICE` | `xhs` | ✅ | 实测是 **`qf`**；不确定用 `--probe-service` 探测 |
 | `TIGER_COUNTRY_ID` | `52` | ✅ | 泰国 = 52（第一优先国家） |
@@ -107,6 +144,7 @@ POST_SLEEP=10                                    # 每条发完的间隔秒
 | `CAPTCHA_REFRESH_DELAY_MIN/MAX` | `3` / `5` | ❌ | 换题前随机停顿，避免机械节奏 |
 | `POST_EXCEL` | 桌面`\测试.xlsx` | ❌ | 发帖配置表路径 |
 | `POST_SLEEP` | `10` | ❌ | 每条发帖间隔 |
+| `POST_ACCOUNT_RETRIES` | `6` | ❌ | 发布遇账号禁言/封号时退出换新号的最大次数（0=不换号） |
 
 ### 自检
 
@@ -233,6 +271,47 @@ Excel 五列：
 | `content` | 正文（≤1000 字） |
 | `tag` | 标签，多个用空格/逗号分隔，带不带 `#` 都行 |
 
+### 4.1 指定发布哪些作品
+
+`--only` 按 **Excel 里的 id 列**（对应窗口序号）筛选，支持区间写法：
+
+```powershell
+# 只发 85、86 两个窗口的稿子
+python xhs_post.py --only 85,86
+
+# 区间 + 零散混用
+python xhs_post.py --only 85,90-95
+
+# 全量（Excel 里所有行）
+python xhs_post.py
+```
+
+执行前会打印命中了多少行，**Excel 里没有的序号会明确提示**：
+
+```
+--only 88,90-91 -> Excel 命中 0/10 行（Excel 里没有: [88, 90, 91]）
+Excel 没有可执行的行
+```
+
+**其他常用组合**：
+
+```powershell
+# 只填内容不点发布（验证素材/标题/标签，不怕发出去）
+python xhs_post.py --only 85 --skip-publish
+
+# 未登录就跳过，不自动注册（省号码钱）
+python xhs_post.py --only 85,86 --no-register
+
+# 换一张 Excel
+python xhs_post.py --excel "D:\投放	月.xlsx" --only 1-5
+
+# 两条之间多留点间隔（默认 10 秒）
+python xhs_post.py --only 85-90 --sleep 30
+```
+
+> `--only` 匹配的是 **Excel 的 id 列**，不是窗口名里的数字——
+> 两者通常一致（`id=85` → 窗口「小红书测试85」），但 Excel 写错了会找不到窗口。
+
 ### 5. 辅助脚本
 
 | 命令 | 作用 |
@@ -293,7 +372,7 @@ Excel 五列：
 | 参数 | 默认 | 说明 |
 |---|---|---|
 | `--excel` | `config.POST_EXCEL` | 发帖配置表 |
-| `--only` | — | 只跑这些窗口序号 |
+| `--only` | — | 只发这些窗口序号（Excel id 列），支持区间 `85,90-95` |
 | `--skip-publish` | 关 | 只填内容不点发布 |
 | `--no-register` | 关 | 未登录不自动注册 |
 | `--wait-seconds` / `--max-numbers` | 继承配置 | 注册时用 |
@@ -391,7 +470,8 @@ POST /group/list  {page:0, pageSize:100, all:true}
   └─ 点发布：等 submit-disabled=false → 通过 _sr 点按钮 → 坐标点击兜底
        ├─ 「图片上传中，请稍后」→ 等 5 秒重点，最多 6 次
        ├─ 「发布成功」→ 关闭页面
-       └─ 账号异常 → 清 cookie 退登 → 重注册 → 重发一次
+       └─ 账号异常（禁言/封号）→ 清 cookie 退登 → 重注册 → 重发
+            └─ 新号仍被禁 → 继续退出换新号，直到能正常发布（上限 POST_ACCOUNT_RETRIES）
 ```
 
 ### 滑块怎么破的
@@ -432,6 +512,7 @@ POST /group/list  {page:0, pageSize:100, all:true}
 | 等码超时后卡住一会才换号 | 平台要求号存活 ≥125 秒才可退 | 正常现象，`cancel_with_retry` 在等够时间，钱会退回 |
 | 滑块一直不过 | 轨迹被判机器 / 选错洞 | 自动换题重试 2 次；仍不过就换窗口（别原地死磕） |
 | 滑块通过但落点偏右 | 拼图块左侧 13px 透明边没扣 | 已在代码里按 alpha bbox 扣除 |
+| 提示「因违反社区规则禁止发笔记」/ 账号禁言 | 账号被限制发布 | 已识别为账号异常，自动退号换新号重发（上限 POST_ACCOUNT_RETRIES） |
 | 发帖提示「图片上传中，请稍后」 | 点太早 | 已改为等缩略图 + 文本静默再点，且会自动重点 |
 | 点发布没反应 | 点到侧边栏「发布笔记」了 | 已改用 `_sr` 精确定位 |
 | 登录成功但 `ok:false` | 停在完善资料页 | 已自动点 Continue |

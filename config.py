@@ -31,10 +31,23 @@ def _load_env():
 _load_env()
 
 # ---------- 接码平台 ----------
+# 接码平台选择：tiger（默认） / hero
+SMS_PROVIDER = os.getenv("SMS_PROVIDER", "tiger").strip().lower()
+
+# tiger 平台
 TIGER_BASE = os.getenv("TIGER_BASE", "https://api.tiger-sms.com/stubs/handler_api.php")
 TIGER_API_KEY = os.getenv("TIGER_SMS_KEY", "")
 # 接码平台默认直连（系统代理往往连不通），需要时填 http://127.0.0.1:7890 之类
 TIGER_PROXY = os.getenv("TIGER_PROXY", "") or None
+
+# hero 平台（sms-activate 兼容协议，文档见工作区 api-cn.json）
+HERO_BASE = os.getenv("HERO_BASE", "https://hero-sms.com/stubs/handler_api.php")
+HERO_API_KEY = os.getenv("HERO_API_KEY", "")
+# hero 平台的 service 代码；留空时用 SERVICE / TIGER_SERVICE
+HERO_SERVICE = os.getenv("HERO_SERVICE", "")
+
+# 平台通用代理（覆盖优先于 TIGER_PROXY）
+SMS_PROXY = os.getenv("SMS_PROXY", "") or None
 
 # 小红书在接码平台的 service 代码（不同平台上架代码不同，按顺序自动探测）
 SERVICE_CANDIDATES = [s.strip() for s in os.getenv(
@@ -115,6 +128,8 @@ API_HOST = os.getenv("XHS_API_HOST", "webapi.rednote.com")
 POST_EXCEL = os.getenv("POST_EXCEL") or str(Path.home() / "Desktop" / "测试.xlsx")
 # 每条发完后的间隔秒
 POST_SLEEP = float(os.getenv("POST_SLEEP", "10"))
+# 发布遇账号禁言/封禁时，退出换新号重试的上限次数（0=不换号重试）
+POST_ACCOUNT_RETRIES = int(os.getenv("POST_ACCOUNT_RETRIES", "6"))
 
 # ---------- 行为参数 ----------
 CODE_WAIT_SECONDS = int(os.getenv("CODE_WAIT_SECONDS", "90"))   # 拿到号码后等码上限

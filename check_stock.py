@@ -3,9 +3,10 @@
 import sys, io, json
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 import config as C
+from sms_factory import make_sms_client
 from tiger_sms import TigerSMS
 
-cli = TigerSMS(C.TIGER_API_KEY, base=C.TIGER_BASE, proxy=C.TIGER_PROXY)
+cli = make_sms_client()
 print("余额:", cli.balance())
 
 print("\n=== 泰国 52 各 service ===")

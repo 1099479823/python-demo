@@ -32,6 +32,7 @@ from playwright.async_api import async_playwright, Page
 
 import config as C
 import xhs_captcha as captcha
+from sms_factory import current_service, make_sms_client
 from tiger_sms import TigerSMS, TigerError, strip_country_prefix
 
 log = logging.getLogger("xhs")
@@ -113,8 +114,9 @@ async def open_login(page: Page) -> None:
             await page.wait_for_timeout(1000)
             if "login" not in page.url:
                 return                      # 已登录，跳走了
-            if await page.locator(C.SEL["phone"]).count():
-                return                      # 表单已就绪
+            if (await page.locator(C.SEL["phone"]).count()
+                    and await page.locator(C.SEL["country_box"]).count()):
+                return                      # 表单（含区号选择器）已就绪
             try:
                 if await page.locator(C.SEL["login_entry"]).count():
                     await page.click(C.SEL["login_entry"], timeout=3000)
@@ -129,6 +131,12 @@ async def select_country(page: Page, label: str, expect_code: str) -> str:
     把登录页区号切到指定国家，返回当前区号文本（如 +66 / +1）。
     label 用国家英文名（Thailand / United States），expect_code 是期望前缀。
     """
+    if not await page.locator(C.SEL["country_box"]).count():
+        log.warning("区号选择器不在当前页面，重新打开登录页")
+        await open_login(page)
+    if not await page.locator(C.SEL["country_box"]).count():
+        log.error("登录页仍未渲染区号选择器，无法切区号")
+        return ""
     await page.click(C.SEL["country_box"], timeout=15000)
     await page.wait_for_timeout(random.randint(700, 1200))
     try:
@@ -276,22 +284,40 @@ def describe_cookies(info: dict) -> str:
 
 async def logged_in(page: Page, timeout: float = 20.0, ctx=None) -> bool:
     """
-    判断是否**真的**登录成功：以页面为准（URL 离开 /login，或已进新用户引导页）。
+    判断是否**真的**登录成功。
 
-    ⚠ 不能只看 cookie：浏览器里可能残留上一轮/失效的 web_session，
-    那样会在验证码都没填对的情况下被判成功（踩过这个坑）。
-    cookie 这里只用来打印日志，不参与判定。
+    判据（按优先级）：
+      1. 登录表单（手机号/验证码输入框）消失且 URL 离开 login  -> 已登录
+      2. 表单消失但 URL 仍带 login（登录后的过渡页/引导页）：
+         - 引导页文本命中 -> 已登录
+         - 浏览器 cookie 有 web_session -> 已登录（账号真的登上了，页面在哪无所谓）
+      3. 表单还在 -> 未登录
+
+    表单消失是硬信号：登录成功后小红书必然跳离表单页。
+    cookie 只做辅助（防「URL 带 login 但不渲染表单」的白屏误判）。
     """
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            if "login" not in page.url:
+            has_phone = (await page.locator(C.SEL["phone"]).count()) > 0
+            has_code = (await page.locator(C.SEL["code_input"]).count()) > 0
+            in_login_url = "login" in page.url
+
+            if not has_phone and not has_code:
+                if not in_login_url:
+                    if ctx is not None:
+                        ok, info = await has_login_cookie(ctx)
+                        log.info("页面已离站，浏览器 cookie: %s", describe_cookies(info))
+                    return True
+                # URL 还挂 login 但表单没了：过渡页 / 引导页
+                if await on_onboarding(page):
+                    return True
                 if ctx is not None:
                     ok, info = await has_login_cookie(ctx)
-                    log.info("页面已离站，浏览器 cookie: %s", describe_cookies(info))
-                return True
-            if await on_onboarding(page):
-                return True
+                    if ok:
+                        log.info("表单已消失且有 web_session，判定已登录: %s",
+                                 describe_cookies(info))
+                        return True
         except Exception:
             pass
         await page.wait_for_timeout(1200)
@@ -324,6 +350,30 @@ async def verify_login(page: Page, ctx=None, timeout: float = 25.0) -> tuple[boo
 
     return True, {"page_ok": True, "cookie_ok": cookie_ok,
                   "cookie": describe_cookies(info), "url": page.url}
+
+
+def parse_seq_spec(spec: str) -> set[int]:
+    """
+    解析窗口序号表达式：'1-20,35,40-45' -> {1..20, 35, 40..45}
+    登录(--seqs) 和发帖(--only) 共用同一套写法。
+    """
+    out: set[int] = set()
+    for part in (spec or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            a, b = part.split("-", 1)
+            try:
+                out.update(range(int(a), int(b) + 1))
+            except ValueError:
+                pass
+        else:
+            try:
+                out.add(int(part))
+            except ValueError:
+                pass
+    return out
 
 
 # ------------------------------------------------------------------ 成功记录
@@ -823,17 +873,21 @@ async def run(args) -> int:
         finally:
             bit_close(browser_id)
 
-    if not C.TIGER_API_KEY:
+    if C.SMS_PROVIDER == "hero":
+        if not C.HERO_API_KEY:
+            log.error("SMS_PROVIDER=hero 但缺少 HERO_API_KEY，在 .env 里填写")
+            return 2
+    elif not C.TIGER_API_KEY:
         log.error("缺少 TIGER_SMS_KEY，先设置环境变量或在 .env 里填写")
         return 2
 
-    cli = TigerSMS(C.TIGER_API_KEY, base=C.TIGER_BASE, proxy=C.TIGER_PROXY)
+    cli = make_sms_client()
     try:
         log.info("接码平台余额: %s", cli.balance())
     except Exception as e:
         log.warning("查询余额失败: %s", e)
 
-    service = args.service or C.SERVICE
+    service = args.service or current_service()
     if args.probe_service:
         ok = cli.probe_services(C.SERVICE_CANDIDATES, C.COUNTRY_ID)
         log.info("可用 service: %s", ok)

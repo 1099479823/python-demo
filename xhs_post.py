@@ -15,7 +15,8 @@ Excel 列：id | path | title | content | tag
 
 用法:
     python xhs_post.py                          # 跑 Excel 里所有行
-    python xhs_post.py --only 100,99            # 只跑指定窗口序号
+    python xhs_post.py --only 100,99            # 只发指定窗口序号
+    python xhs_post.py --only 85,90-95          # 支持区间写法
     python xhs_post.py --skip-publish           # 只填内容不点发布（验证流程）
     python xhs_post.py --no-register            # 未登录就跳过，不自动注册
 """
@@ -38,6 +39,7 @@ from playwright.async_api import async_playwright
 import config as C
 import xhs_login as XL
 import xhs_publish as P
+from sms_factory import current_service, make_sms_client
 from tiger_sms import TigerSMS, strip_country_prefix
 from xhs_login import (bit_close, bit_open, handle_onboarding, logged_in,
                        open_login, record_success, select_country,
@@ -49,7 +51,12 @@ log = logging.getLogger("post")
 DEFAULT_EXCEL = C.POST_EXCEL
 RESULT_FILE = Path("post_results.json")
 
-ACCOUNT_BLOCK_HINTS = ("账号异常", "禁止发布", "被封禁", "封禁", "存在风险", "账号受限")
+ACCOUNT_BLOCK_HINTS = ("您的账号处于禁言状态", "账号处于禁言", "已被禁言", "被禁言",
+                        "已被封禁", "被封禁", "封号", "账号异常", "账号受限",
+                        "禁止发布", "禁止发笔记", "禁止发帖", "禁止发表",
+                        "违反社区规则", "违反社区公约", "社区规则",
+                        "无法发布", "不能发布", "暂不支持发布",
+                        "存在风险", "功能受限", "账号冻结")
 
 
 # ------------------------------------------------------------------ Excel
@@ -123,7 +130,7 @@ async def ensure_login(page, ctx, cli: TigerSMS, browser_id: str, win_name: str,
         return True, {}
 
     # 多国家回退：按当前可用号码数排序（号多的先用），接不到再换下一个
-    for country in XL.order_countries(cli, C.SERVICE):
+    for country in XL.order_countries(cli, current_service()):
         cn = country.get("cn", country["label"])
         cur = await select_country(page, country["label"], country["code"])
         if country["code"] not in cur:
@@ -135,7 +142,7 @@ async def ensure_login(page, ctx, cli: TigerSMS, browser_id: str, win_name: str,
         for n in range(1, args.max_numbers + 1):
             log.info("=== %s 第 %d/%d 个号码 ===", cn, n, args.max_numbers)
             try:
-                r = await try_one_number(page, cli, C.SERVICE, country, args.wait_seconds, ctx=ctx)
+                r = await try_one_number(page, cli, current_service(), country, args.wait_seconds, ctx=ctx)
             except XL.NoNumbersError as e:
                 log.warning("%s 无库存，换下一个国家: %s", cn, e)
                 break
@@ -144,16 +151,22 @@ async def ensure_login(page, ctx, cli: TigerSMS, browser_id: str, win_name: str,
                 r = {"ok": False, "reason": f"exception:{e}"}
 
             if r.get("ok"):
-                # try_one_number 内部已做严格校验，这里再确认一次 cookie 落盘
-                ok_v, detail = await XL.verify_login(page, ctx=ctx, timeout=5)
-                if not ok_v:
-                    log.warning("接码成功但登录校验未通过: %s", detail.get("reason"))
-                    r = {"ok": False, "reason": f"login_verify_failed:{detail.get('reason')}"}
-                else:
+                # try_one_number 内部已做严格校验（页面离站 + cookie）。
+                # 登录后可能停在带 login 的过渡/引导 URL，这里只确认 cookie 落盘，
+                # 不再用页面 URL 二次误杀；引导页能跳就跳，跳不动也不影响发帖。
+                ok_c, info = await XL.has_login_cookie(ctx)
+                for _ in range(4):
+                    if ok_c:
+                        break
+                    await page.wait_for_timeout(1000)
+                    ok_c, info = await XL.has_login_cookie(ctx)
+                if ok_c:
                     await handle_onboarding(page)
                     record_success(browser_id, win_name, r.get("phone") or "", r.get("code") or "")
-                    log.info("%s 注册登录成功: %s | %s", cn, page.url, detail.get("cookie"))
+                    log.info("%s 注册登录成功: %s | %s", cn, page.url, XL.describe_cookies(info))
                     return True, r
+                log.warning("接码成功但浏览器未写入 web_session: %s", XL.describe_cookies(info))
+                r = {"ok": False, "reason": "login_verify_failed:no_cookie"}
 
             log.warning("%s 第 %d/%d 个号失败: %s", cn, n, args.max_numbers, r.get("reason"))
             try:
@@ -206,23 +219,47 @@ async def run_row(pw, cli: TigerSMS, row: dict, args) -> dict:
             res.update({"ok": True, "reason": "skip-publish"})
             return res
 
-        pr = await P.publish_post(page, row["path"], row["title"], row["content"], row["tags"])
-        res.update({"ok": pr["ok"], "reason": pr.get("reason", "")})
-        log.info("发帖结果: %s | %s", "成功" if pr["ok"] else "失败", pr.get("reason"))
+        # 账号被禁言/封禁 -> 退出换新号重试，直到能正常发布或达到上限
+        max_retry = getattr(C, "POST_ACCOUNT_RETRIES", 6)
+        retried = 0
+        pr = None
+        while True:
+            pr = await P.publish_post(page, row["path"], row["title"],
+                                      row["content"], row["tags"])
+            res.update({"ok": pr["ok"], "reason": pr.get("reason", ""),
+                        "account_retries": retried})
+            log.info("发帖结果: %s | %s (第 %d 次尝试)",
+                     "成功" if pr["ok"] else "失败", pr.get("reason"), retried + 1)
 
-        # 账号异常 -> 退出重登再发一次
-        if not pr["ok"] and any(k in (pr.get("reason") or "") for k in ACCOUNT_BLOCK_HINTS):
-            log.warning("判定为账号异常，退出登录后重新注册并重发")
+            if pr["ok"]:
+                break
+            if not any(k in (pr.get("reason") or "") for k in ACCOUNT_BLOCK_HINTS):
+                break                        # 非账号问题（内容被拒/上传失败），不换号
+            if retried >= max_retry:
+                log.warning("账号连续被禁/封 %d 次，放弃本条", retried + 1)
+                break
+
+            log.warning("账号异常（%s），退出并注册新号重试 (%d/%d)",
+                        pr.get("reason"), retried + 1, max_retry)
+            retried += 1
             await P.logout(ctx)
             ok2, info2 = await ensure_login(page, ctx, cli, bid, win_name, args)
-            if ok2:
-                pr2 = await P.publish_post(page, row["path"], row["title"],
-                                           row["content"], row["tags"])
-                res.update({"ok": pr2["ok"], "reason": pr2.get("reason", ""),
-                            "retried": True})
-                log.info("重发结果: %s | %s", "成功" if pr2["ok"] else "失败", pr2.get("reason"))
-            else:
-                res.update({"reason": f"重登失败: {info2.get('reason')}", "retried": True})
+            if not ok2:
+                res.update({"ok": False,
+                            "reason": f"换号重登失败: {info2.get('reason')}（原账号异常: {pr.get('reason')}）",
+                            "account_retries": retried})
+                break
+            await page.wait_for_timeout(1500)
+
+        if retried:
+            res["retried"] = True
+            res["account_retries"] = retried
+            if pr and pr.get("ok"):
+                res["reason"] = f"换号成功(共试 {retried + 1} 个账号)后发布成功"
+                log.info("换号重发成功: 共试 %d 个账号", retried + 1)
+            elif pr:
+                res["reason"] = f"连续 {retried + 1} 个账号均被禁/封: {pr.get('reason')}"
+                log.warning("连续 %d 个账号均被禁/封: %s", retried + 1, pr.get("reason"))
 
         # 关闭发帖页面
         try:
@@ -239,8 +276,15 @@ async def run_row(pw, cli: TigerSMS, row: dict, args) -> dict:
 async def main(args) -> int:
     rows = read_excel(args.excel)
     if args.only:
-        want = {int(x) for x in args.only.split(",") if x.strip().isdigit()}
+        want = XL.parse_seq_spec(args.only)      # 支持 85,86,90-95
+        if not want:
+            print(f"--only {args.only!r} 解析不到任何序号，示例：85,86,90-95")
+            return 2
+        before = len(rows)
         rows = [r for r in rows if r["seq"] in want]
+        missing = sorted(want - {r["seq"] for r in rows})
+        print(f"--only {args.only} -> Excel 命中 {len(rows)}/{before} 行"
+              + (f"（Excel 里没有: {missing}）" if missing else ""))
     if not rows:
         print("Excel 没有可执行的行")
         return 2
@@ -250,7 +294,7 @@ async def main(args) -> int:
         print(f"  窗口{r['seq']:>4}  {P.kind_of(r['path']):6}  {Path(r['path']).name[:36]}  "
               f"标题={r['title']!r} 标签={r['tags']}")
 
-    cli = TigerSMS(C.TIGER_API_KEY, base=C.TIGER_BASE, proxy=C.TIGER_PROXY)
+    cli = make_sms_client()
     results = []
     async with async_playwright() as pw:
         for i, row in enumerate(rows, 1):
@@ -285,7 +329,8 @@ async def main(args) -> int:
 def build_parser():
     ap = argparse.ArgumentParser(description="Excel 驱动批量发帖")
     ap.add_argument("--excel", default=DEFAULT_EXCEL)
-    ap.add_argument("--only", default="", help="只跑这些窗口序号，逗号分隔")
+    ap.add_argument("--only", default="",
+                    help="只发这些窗口序号，支持区间：85,86,90-95")
     ap.add_argument("--skip-publish", action="store_true", help="只填内容不点发布")
     ap.add_argument("--no-register", action="store_true", help="未登录不自动注册")
     ap.add_argument("--wait-seconds", type=int, default=C.CODE_WAIT_SECONDS)

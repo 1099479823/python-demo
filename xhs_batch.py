@@ -39,6 +39,7 @@ from pathlib import Path
 import requests
 
 import config as C
+from sms_factory import make_sms_client
 from tiger_sms import TigerSMS
 
 PY = sys.executable
@@ -64,25 +65,8 @@ def seq_of(b: dict) -> int:
     return int(n) if n else 0
 
 
-def parse_seq_spec(spec: str) -> set[int]:
-    """'1-20,35,40-45' -> {1..20, 35, 40..45}"""
-    out: set[int] = set()
-    for part in (spec or "").split(","):
-        part = part.strip()
-        if not part:
-            continue
-        if "-" in part:
-            a, b = part.split("-", 1)
-            try:
-                out.update(range(int(a), int(b) + 1))
-            except ValueError:
-                pass
-        else:
-            try:
-                out.add(int(part))
-            except ValueError:
-                pass
-    return out
+# 序号表达式解析与登录模块共用（'85,86,90-95' 写法一致）
+from xhs_login import parse_seq_spec  # noqa: E402
 
 
 def pick(args) -> list[dict]:
@@ -148,7 +132,7 @@ def wait_all_closed(bid: str, timeout: float = 30) -> None:
 # ------------------------------------------------------------------ 余额
 def balance() -> float:
     try:
-        cli = TigerSMS(C.TIGER_API_KEY, base=C.TIGER_BASE, proxy=C.TIGER_PROXY)
+        cli = make_sms_client()
         return float(cli.balance())
     except Exception as e:
         print(f"  (余额查询失败: {e})")
