@@ -99,7 +99,7 @@ TIGER_MAX_PRICE_US=0.05        # 美国号单价上限，超过不买
 COUNTRY_ORDER=th,us
 
 # ---------- 取号 / 等码 ----------
-CODE_WAIT_SECONDS=90           # 从「点击发送验证码」起算的等码预算
+CODE_WAIT_SECONDS=90           # 从「点击发送验证码」起算的等码预算（滑块耗时不计）
 MAX_NUMBERS=3                  # 每个国家最多试几个号
 NUMBER_ATTEMPTS=4              # 取号无库存时重试次数
 NUMBER_RETRY_INTERVAL=5        # 每次重试间隔（秒）
@@ -135,7 +135,7 @@ POST_SLEEP=10                                    # 每条发完的间隔秒
 | `TIGER_COUNTRY_ID_US` | `187` | ❌ | 美国编号（备用） |
 | `TIGER_COUNTRY_CODE_US` | `1` | ❌ | 美国前缀，`19295503141` 剥成 `9295503141` |
 | `TIGER_MAX_PRICE_US` | `0.05` | ❌ | 美国单价上限，超价的 provider 不买 |
-| `CODE_WAIT_SECONDS` | `90` | ❌ | **从点击发送验证码起算**的等码预算（含滑块耗时） |
+| `CODE_WAIT_SECONDS` | `90` | ❌ | **从点击发送验证码起算**的等码预算（**滑块拖动耗时不计入**） |
 | `MAX_NUMBERS` | `3` | ❌ | 每个国家最多试几个号；该国全失败就换下一个国家 |
 | `NUMBER_ATTEMPTS` | `4` | ❌ | 连 4 次取不到号 → 「当前时段无手机号可用」 |
 | `NUMBER_RETRY_INTERVAL` | `5` | ❌ | 取号失败重试间隔 |
@@ -449,7 +449,7 @@ POST /group/list  {page:0, pageSize:100, all:true}
 4. 点 `Get code`，记下时刻 **t_send**：
    - 返回 **471** → 弹滑块 → 识别缺口 + 拟人拖动 → 通过后前端重发 → **200**
    - 返回 **200 但 `code:-13002`**（发送失败）→ **立即退号换下一个**
-5. 等码预算 = `90s - (now - t_send)`，滑块耗时也算在内：
+5. 等码预算 = `90s - (now - t_send - 滑块耗时)`，**滑块拖动时间不计入**：
    - 剩余 <15s → 直接退号换号（不白等）
    - 否则轮询 `getStatus` 直到收到或超时
 6. 超时/失败 → **退号退款**：平台要求号存活 ≥125 秒，不够就等够再退（`cancel_with_retry`），退成功才换下一个号

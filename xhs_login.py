@@ -684,9 +684,14 @@ async def try_one_number(page: Page, cli: TigerSMS, service: str,
     log.info("发码响应: %s", trace[-3:] or "无请求")
 
     # 出现滑块则处理；通过后前端自动重发 send_code
+    # 滑块属于风控交互，不是等短信，耗时不计入 90 秒等码预算
+    captcha_cost = 0.0
     if await captcha.wait_captcha(page, timeout=20):
         log.info("检测到滑块，开始处理")
+        t_cap = time.time()
         ok = await captcha.solve_captcha(page, C.ASSETS_DIR, retries=C.CAPTCHA_RETRIES)
+        captcha_cost = time.time() - t_cap
+        log.info("滑块耗时 %.1fs（不计入等码预算）", captcha_cost)
         if not ok:
             # 滑块没过，但短信可能已经发出去了 —— 放弃就白花钱，先试着收码
             log.warning("滑块未通过，先确认是否有短信到达（有就直接用掉，不退号）")
@@ -763,13 +768,16 @@ async def try_one_number(page: Page, cli: TigerSMS, service: str,
                 "activation": act.id_dict(), "trace": trace}
     log.info("短信已发出，开始等码 (响应序列 %s)", [t["status"] for t in trace])
 
-    # 等码预算：从「点击发送验证码」起算 90 秒（滑块耗时也算在内）。
+    # 等码预算：从「点击发送验证码」起算 90 秒，**扣除滑块拖动耗时**。
     # 剩余不足 15 秒就直接换号，免得刚点完码就超时白等。
-    elapsed = time.time() - t_send
+    wall = time.time() - t_send
+    elapsed = max(0.0, wall - captcha_cost)
     remain = wait_seconds - elapsed
-    log.info("等码预算: 总 %ss - 发码/滑块已用 %.0fs = 剩余 %.0fs", wait_seconds, elapsed, remain)
+    log.info("等码预算: 总 %ss - 已用 %.0fs（其中滑块 %.0fs 不计） = 剩余 %.0fs",
+             wait_seconds, elapsed, captcha_cost, remain)
     if remain < 15:
-        log.warning("发码+滑块已用 %.0fs，剩余不足 15s，直接退号换下一个号码", elapsed)
+        log.warning("发码已用 %.0fs（滑块 %.0fs 已扣除），剩余不足 15s，直接退号换下一个号码",
+                    elapsed, captcha_cost)
         ok_c, resp_c = cli.cancel_with_retry(act.activation_id, t_acq)
         if not ok_c:
             log.warning("退号失败(可能仍在计费): %s", resp_c)
